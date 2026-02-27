@@ -1,9 +1,4 @@
 .esphome/
 __pycache__/
 *.pyc
-sdkconfig
-sdkconfig.old
-build/
-managed_components/
-dependencies.lock
 secrets.yaml

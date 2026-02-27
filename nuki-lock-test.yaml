@@ -1,0 +1,71 @@
+esphome:
+  name: nuki-lock-test
+  friendly_name: Nuki Lock Test
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+wifi:
+  ssid: "TestNetwork"
+  password: "testpassword123"
+
+api:
+  custom_services: true
+  homeassistant_services: true
+
+logger:
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+lock:
+  - platform: nuki_lock
+    name: "Nuki Lock"
+    security_pin: 123456
+
+    connected:
+      name: "Nuki Connected"
+    paired:
+      name: "Nuki Paired"
+    battery_critical:
+      name: "Nuki Battery Critical"
+    door_sensor:
+      name: "Nuki Door Sensor"
+
+    battery_level:
+      name: "Nuki Battery Level"
+    bt_signal_strength:
+      name: "Nuki BT Signal"
+
+    door_sensor_state:
+      name: "Nuki Door State"
+    last_unlock_user:
+      name: "Nuki Last User"
+    last_lock_action:
+      name: "Nuki Last Action"
+
+    pairing_mode:
+      name: "Nuki Pairing Mode"
+    led_enabled:
+      name: "Nuki LED"
+    auto_unlatch:
+      name: "Nuki Auto Unlatch"
+    button_enabled:
+      name: "Nuki Button"
+
+    unpair:
+      name: "Nuki Unpair"
+
+    led_brightness:
+      name: "Nuki LED Brightness"
+
+    fob_action_1:
+      name: "Nuki Fob Action 1"

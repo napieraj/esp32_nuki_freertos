@@ -1,0 +1,22 @@
+---
+description: Rules for FreeRTOS task pinning, Inter-Process Communication (IPC), Queue management, and thread safety.
+globs: *.cpp, *.h
+---
+# FreeRTOS & Concurrency Implementation
+
+## 1. Component Lifecycle & Task Creation
+
+- Inherit from `esphome::Component` and override `get_setup_priority()` to return `esphome::setup_priority::BLUETOOTH`.
+- In `setup()`: Create Queues (`xQueueCreate`) and the worker task (`xTaskCreatePinnedToCore` to `PRO_CPU` / Core 0).
+- **Stack Size:** NaCl cryptography requires significant stack space. Allocate `10240` bytes to safely handle Gen 5 Ultra auth payloads.
+
+## 2. Thread Safety & IPC
+
+- **NEVER** call ESPHome state updates (e.g., `this->publish_state()`) directly from a BLE callback or a FreeRTOS worker task.
+- **Data to Main Loop:** Pass data back using FreeRTOS Queues. In ESPHome's `loop()`, poll non-blocking: `xQueueReceive(queue, &msg, 0)`.
+- **Alternative Sync:** Use ESPHome's scheduler: `this->defer([this, state]() { this->publish_state(state); });`.
+
+## 3. Task Watchdog (TWDT)
+
+- Inside the worker `while(1)` loop, always yield to prevent watchdog resets: `vTaskDelay(pdMS_TO_TICKS(10));`.
+- Avoid `malloc()` or `new` inside the `while(1)` loop. Pre-allocate DMA-capable buffers (`std::array<uint8_t, 256>`) during `setup()`.

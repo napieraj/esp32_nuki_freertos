@@ -22,18 +22,16 @@ lock::LockState NukiProLock::nuki_to_esphome_state(NukiLock::LockState s) {
 // ── Preference persistence (2026 API) ──────────────────────────────────
 
 void NukiProLock::save_pairing_data() {
-    NukiPairingData data{};
-    data.paired = this->paired_.load();
-    data.pin = this->pin_.empty() ? 0 : static_cast<uint32_t>(std::stoul(this->pin_));
-    if (!this->pref_.save(&data)) {
+    bool paired = this->paired_.load();
+    if (!this->paired_pref_.save(&paired)) {
         ESP_LOGW(TAG, "Failed to persist pairing data");
     }
 }
 
 void NukiProLock::load_pairing_data() {
-    NukiPairingData data{};
-    if (this->pref_.load(&data)) {
-        ESP_LOGD(TAG, "Restored pairing data (paired=%s)", YESNO(data.paired));
+    bool paired = false;
+    if (this->paired_pref_.load(&paired)) {
+        ESP_LOGD(TAG, "Restored pairing data (paired=%s)", YESNO(paired));
     }
 }
 
@@ -45,32 +43,33 @@ void NukiProLock::setup() {
     esp_task_wdt_config_t wdt = {.timeout_ms = 15000, .trigger_panic = false};
     esp_task_wdt_reconfigure(&wdt);
 
-    // 2026 preference API: collision-free entity-scoped storage
-    this->pref_ = this->make_entity_preference<NukiPairingData>();
+    // 2026 preference API: collision-free entity-scoped storage (version 1)
+    this->paired_pref_ = this->make_entity_preference<bool>(1);
     this->load_pairing_data();
+
+    // Construct NukiLock with configurable device ID (deferred from ctor
+    // because NukiBle has no deviceId setter — must wait for set_device_id())
+    this->nuki_lock_ = std::make_unique<NukiLock::NukiLock>("NukiESPHome", this->nuki_id_);
+    this->nuki_lock_->setEventHandler(this);
 
     this->scanner_.initialize("ESPHomeNuki", true, 40, 40);
     this->scanner_.setScanDuration(0);
 
-    uint32_t pin_int = 0;
-    if (!this->pin_.empty()) {
-        pin_int = static_cast<uint32_t>(std::stoul(this->pin_));
-    }
-    this->nuki_lock_.saveUltraPincode(pin_int, false);
+    this->nuki_lock_->saveUltraPincode(this->pin_, false);
 
-    this->nuki_lock_.setDebugConnect(true);
-    this->nuki_lock_.setDebugCommunication(false);
-    this->nuki_lock_.setDebugReadableData(false);
-    this->nuki_lock_.setDebugHexData(false);
-    this->nuki_lock_.setDebugCommand(false);
+    this->nuki_lock_->setDebugConnect(true);
+    this->nuki_lock_->setDebugCommunication(false);
+    this->nuki_lock_->setDebugReadableData(false);
+    this->nuki_lock_->setDebugHexData(false);
+    this->nuki_lock_->setDebugCommand(false);
 
-    this->nuki_lock_.initialize();
-    this->nuki_lock_.registerBleScanner(&this->scanner_);
-    this->nuki_lock_.setConnectTimeout(BLE_CONNECT_TIMEOUT);
-    this->nuki_lock_.setConnectRetries(BLE_CONNECT_RETRIES);
-    this->nuki_lock_.setDisconnectTimeout(BLE_DISCONNECT_TIMEOUT);
+    this->nuki_lock_->initialize();
+    this->nuki_lock_->registerBleScanner(&this->scanner_);
+    this->nuki_lock_->setConnectTimeout(BLE_CONNECT_TIMEOUT);
+    this->nuki_lock_->setConnectRetries(BLE_CONNECT_RETRIES);
+    this->nuki_lock_->setDisconnectTimeout(BLE_DISCONNECT_TIMEOUT);
 
-    this->paired_.store(this->nuki_lock_.isPairedWithLock());
+    this->paired_.store(this->nuki_lock_->isPairedWithLock());
 
     if (this->paired_.load()) {
         ESP_LOGI(TAG, "Already paired");
@@ -83,18 +82,18 @@ void NukiProLock::setup() {
     this->command_queue_ = xQueueCreate(10, sizeof(NukiCommand));
     if (this->command_queue_ == nullptr) {
         ESP_LOGE(TAG, "Queue creation failed");
-        this->mark_failed();
+        this->mark_failed(LOG_STR("Command queue creation failed"));
         return;
     }
 
     // BLE task → Core 0 (NimBLE affinity, isolated from LwIP on Core 1)
     BaseType_t res = xTaskCreatePinnedToCore(
         NukiProLock::nuki_task_runner, "nukiBLE",
-        8192, this, 5, &this->task_handle_, 0);
+        10240, this, 5, &this->task_handle_, 0);
 
     if (res != pdPASS) {
         ESP_LOGE(TAG, "BLE task creation failed");
-        this->mark_failed();
+        this->mark_failed(LOG_STR("BLE task creation failed"));
         return;
     }
 
@@ -103,12 +102,13 @@ void NukiProLock::setup() {
              YESNO(this->keepalive_), this->poll_interval_ms_);
 }
 
-// ── Loop (Core 1) — sub-microsecond atomic check ──────────────────────
+// ── Loop (Core 1) — event-driven, woken by Core 0 ────────────────────
 
 void NukiProLock::loop() {
     if (this->state_updated_.exchange(false)) {
         this->publish_state(this->pending_state_.load());
     }
+    this->disable_loop();
 }
 
 // ── Control (Core 1 → queue → Core 0) ─────────────────────────────────
@@ -163,9 +163,13 @@ void NukiProLock::nuki_task() {
     uint8_t action_retries = 0;
     NukiLock::LockAction pending_action = NukiLock::LockAction::Lock;
 
+    // 8s keepalive pulse — stays under Nuki 5.0 Pro's 10s idle disconnect
+    const uint32_t KEEPALIVE_MS = 8000;
+    uint32_t last_keepalive = millis();
+
     while (true) {
         this->scanner_.update();
-        this->nuki_lock_.updateConnectionState();
+        this->nuki_lock_->updateConnectionState();
 
         NukiCommand cmd;
 
@@ -177,6 +181,7 @@ void NukiProLock::nuki_task() {
                     ESP_LOGI(TAG, "→ LOCK");
                     this->pending_state_.store(lock::LOCK_STATE_LOCKING);
                     this->state_updated_.store(true);
+                    this->enable_loop_soon_any_context();
                     if (this->execute_lock_action(NukiLock::LockAction::Lock)) {
                         this->status_poll_requested_.store(true);
                     } else {
@@ -189,6 +194,7 @@ void NukiProLock::nuki_task() {
                     ESP_LOGI(TAG, "→ UNLOCK");
                     this->pending_state_.store(lock::LOCK_STATE_UNLOCKING);
                     this->state_updated_.store(true);
+                    this->enable_loop_soon_any_context();
                     if (this->execute_lock_action(NukiLock::LockAction::Unlock)) {
                         this->status_poll_requested_.store(true);
                     } else {
@@ -201,6 +207,7 @@ void NukiProLock::nuki_task() {
                     ESP_LOGI(TAG, "→ UNLATCH");
                     this->pending_state_.store(lock::LOCK_STATE_UNLOCKING);
                     this->state_updated_.store(true);
+                    this->enable_loop_soon_any_context();
                     if (this->execute_lock_action(NukiLock::LockAction::Unlatch)) {
                         this->status_poll_requested_.store(true);
                     } else {
@@ -213,6 +220,7 @@ void NukiProLock::nuki_task() {
                     ESP_LOGI(TAG, "→ LOCK_N_GO");
                     this->pending_state_.store(lock::LOCK_STATE_LOCKING);
                     this->state_updated_.store(true);
+                    this->enable_loop_soon_any_context();
                     this->execute_lock_action(NukiLock::LockAction::LockNgo);
                     this->status_poll_requested_.store(true);
                     break;
@@ -223,11 +231,12 @@ void NukiProLock::nuki_task() {
 
                 case NukiCommandType::UNPAIR:
                     ESP_LOGI(TAG, "→ UNPAIR");
-                    this->nuki_lock_.unPairNuki();
+                    this->nuki_lock_->unPairNuki();
                     this->paired_.store(false);
                     this->save_pairing_data();
                     this->pending_state_.store(lock::LOCK_STATE_NONE);
                     this->state_updated_.store(true);
+                    this->enable_loop_soon_any_context();
                     break;
 
                 case NukiCommandType::NONE:
@@ -253,10 +262,12 @@ void NukiProLock::nuki_task() {
             }
 
             if (this->paired_.load()) {
-                // Keepalive: always poll on timeout to hold the BLE connection
-                // Non-keepalive: only poll when explicitly requested
-                if (this->keepalive_ || this->status_poll_requested_.exchange(false)) {
+                if (this->status_poll_requested_.exchange(false)) {
                     this->do_status_poll();
+                    last_keepalive = millis();
+                } else if (this->keepalive_ && (millis() - last_keepalive > KEEPALIVE_MS)) {
+                    this->do_status_poll();
+                    last_keepalive = millis();
                 }
             }
         }
@@ -266,11 +277,11 @@ void NukiProLock::nuki_task() {
 // ── BLE operations (Core 0) ───────────────────────────────────────────
 
 bool NukiProLock::execute_lock_action(NukiLock::LockAction action) {
-    if (!this->nuki_lock_.isPairedWithLock()) {
+    if (!this->nuki_lock_->isPairedWithLock()) {
         ESP_LOGE(TAG, "Not paired");
         return false;
     }
-    Nuki::CmdResult result = this->nuki_lock_.lockAction(action);
+    Nuki::CmdResult result = this->nuki_lock_->lockAction(action);
     char buf[30] = {0}, act[30] = {0};
     NukiLock::cmdResultToString(result, buf);
     NukiLock::lockactionToString(action, act);
@@ -284,12 +295,13 @@ bool NukiProLock::execute_lock_action(NukiLock::LockAction action) {
 }
 
 void NukiProLock::do_status_poll() {
-    Nuki::CmdResult r = this->nuki_lock_.requestKeyTurnerState(&this->key_turner_state_);
+    Nuki::CmdResult r = this->nuki_lock_->requestKeyTurnerState(&this->key_turner_state_);
     if (r == Nuki::CmdResult::Success) {
         this->connected_.store(true);
         auto new_state = this->nuki_to_esphome_state(this->key_turner_state_.lockState);
         this->pending_state_.store(new_state);
         this->state_updated_.store(true);
+        this->enable_loop_soon_any_context();
 
         if (this->key_turner_state_.lockState == NukiLock::LockState::Locking ||
             this->key_turner_state_.lockState == NukiLock::LockState::Unlocking) {
@@ -303,14 +315,13 @@ void NukiProLock::do_status_poll() {
 
 void NukiProLock::do_pair() {
     ESP_LOGI(TAG, "Pairing (Ultra/5th Gen)...");
-    auto pr = this->nuki_lock_.pairNuki(Nuki::AuthorizationIdType::App);
+    auto pr = this->nuki_lock_->pairNuki(Nuki::AuthorizationIdType::App);
     if (pr == Nuki::PairingResult::Success) {
         ESP_LOGI(TAG, "Paired!");
         this->paired_.store(true);
         this->pairing_mode_.store(false);
-        if (!this->pin_.empty()) {
-            this->nuki_lock_.saveUltraPincode(
-                static_cast<uint32_t>(std::stoul(this->pin_)));
+        if (this->pin_ != 0) {
+            this->nuki_lock_->saveUltraPincode(this->pin_);
         }
         this->save_pairing_data();
         this->status_poll_requested_.store(true);
@@ -321,7 +332,8 @@ void NukiProLock::do_pair() {
 
 void NukiProLock::dump_config() {
     ESP_LOGCONFIG(TAG, "Nuki 5.0 Pro:");
-    ESP_LOGCONFIG(TAG, "  PIN: %s", this->pin_.c_str());
+    ESP_LOGCONFIG(TAG, "  PIN: %06u", this->pin_);
+    ESP_LOGCONFIG(TAG, "  Nuki ID: %u", this->nuki_id_);
     ESP_LOGCONFIG(TAG, "  Poll: %u ms", this->poll_interval_ms_);
     ESP_LOGCONFIG(TAG, "  Keepalive: %s", YESNO(this->keepalive_));
     ESP_LOGCONFIG(TAG, "  Paired: %s", YESNO(this->paired_.load()));

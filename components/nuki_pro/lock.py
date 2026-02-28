@@ -20,6 +20,7 @@ NukiProLock = nuki_pro_ns.class_("NukiProLock", lock.Lock, cg.Component)
 
 CONF_POLL_INTERVAL = "poll_interval"
 CONF_KEEPALIVE = "keepalive"
+CONF_NUKI_ID = "nuki_id"
 
 
 def validate_pin(value):
@@ -31,6 +32,7 @@ def validate_pin(value):
 
 CONFIG_SCHEMA = lock.lock_schema(NukiProLock).extend({
     cv.Required(CONF_PIN): validate_pin,
+    cv.Optional(CONF_NUKI_ID, default=2020002): cv.uint32_t,
     cv.Optional(CONF_POLL_INTERVAL, default="100ms"): cv.positive_time_period_milliseconds,
     cv.Optional(CONF_KEEPALIVE, default=True): cv.boolean,
 }).extend(cv.COMPONENT_SCHEMA)
@@ -40,7 +42,8 @@ async def to_code(config):
     var = await lock.new_lock(config)
     await cg.register_component(var, config)
 
-    cg.add(var.set_pin(config[CONF_PIN]))
+    cg.add(var.set_pin(int(config[CONF_PIN])))
+    cg.add(var.set_nuki_id(config[CONF_NUKI_ID]))
     cg.add(var.set_poll_interval(config[CONF_POLL_INTERVAL]))
     cg.add(var.set_keepalive(config[CONF_KEEPALIVE]))
 
@@ -63,13 +66,17 @@ async def to_code(config):
 
     # ── Core isolation: move TCP/IP (LwIP) to Core 1 ───────────────
     # Keeps Core 0 exclusive for BLE — critical for PoE boards where
-    # Ethernet MAC interrupts would otherwise cause BLE jitter
+    # Ethernet MAC interrupts would otherwise cause BLE jitter.
+    # NOTE: USE_ETHERNET is defined by the ethernet component itself;
+    # we intentionally do NOT set it here so the lock component
+    # remains compatible with WiFi-only configurations.
     add_idf_sdkconfig_option("CONFIG_LWIP_TCPIP_TASK_AFFINITY", 1)
 
-    # ── 2026.2 selective compilation: keep Ethernet drivers ─────────
-    # Without this, PoE boards (Olimex ESP32-POE, Waveshare ETH) get
-    # linker errors as the build strips "unused" network components
+    # ── Selective compilation: keep IDF components for PoE boards ──
+    # Prevents build from stripping network/storage drivers that
+    # Ethernet-equipped boards depend on
     include_builtin_idf_component("esp_eth")
+    include_builtin_idf_component("esp_vfs_fat")
 
     cg.add_define("NUKI_NO_WDT_RESET")
     cg.add_build_flag("-Wno-unused-result")

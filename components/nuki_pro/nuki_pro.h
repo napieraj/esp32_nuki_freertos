@@ -33,6 +33,11 @@ static const uint8_t BLE_CONNECT_RETRIES = 5;
 static const uint16_t BLE_DISCONNECT_TIMEOUT = 2000;
 static const uint8_t MAX_ACTION_ATTEMPTS = 5;
 
+struct NukiPairingData {
+    bool paired;
+    uint32_t pin;
+};
+
 class NukiProLock : public lock::Lock, public Component,
                     public Nuki::SmartlockEventHandler {
  public:
@@ -43,6 +48,7 @@ class NukiProLock : public lock::Lock, public Component,
 
     void set_pin(const std::string &pin) { this->pin_ = pin; }
     void set_poll_interval(uint32_t ms) { this->poll_interval_ms_ = ms; }
+    void set_keepalive(bool v) { this->keepalive_ = v; }
 
     void setup() override;
     void loop() override;
@@ -62,9 +68,12 @@ class NukiProLock : public lock::Lock, public Component,
     bool execute_lock_action(NukiLock::LockAction action);
     void do_status_poll();
     void do_pair();
+    void save_pairing_data();
+    void load_pairing_data();
 
     std::string pin_;
     uint32_t poll_interval_ms_{100};
+    bool keepalive_{true};
 
     TaskHandle_t task_handle_{nullptr};
     QueueHandle_t command_queue_{nullptr};

@@ -27,3 +27,5 @@ lock:
   - platform: nuki_pro
     name: "Front Door Nuki 5.0"
     pin: "065432"
+    keepalive: true
+    poll_interval: 100ms

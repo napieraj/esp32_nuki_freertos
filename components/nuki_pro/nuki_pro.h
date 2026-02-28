@@ -8,6 +8,7 @@
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <atomic>
+#include <memory>
 #include <string>
 
 #include "NukiLock.h"
@@ -27,26 +28,20 @@ struct NukiCommand {
     NukiCommandType type;
 };
 
-static const uint32_t DEVICE_ID = 2020002;
 static const uint8_t BLE_CONNECT_TIMEOUT = 2;
 static const uint8_t BLE_CONNECT_RETRIES = 5;
 static const uint16_t BLE_DISCONNECT_TIMEOUT = 2000;
 static const uint8_t MAX_ACTION_ATTEMPTS = 5;
 
-struct NukiPairingData {
-    bool paired;
-    uint32_t pin;
-};
-
 class NukiProLock : public lock::Lock, public Component,
                     public Nuki::SmartlockEventHandler {
  public:
-    NukiProLock() : nuki_lock_("NukiESPHome", DEVICE_ID) {
-        this->nuki_lock_.setEventHandler(this);
+    NukiProLock() {
         this->traits.set_supports_open(true);
     }
 
-    void set_pin(const std::string &pin) { this->pin_ = pin; }
+    void set_pin(uint32_t pin) { this->pin_ = pin; }
+    void set_device_id(uint32_t id) { this->device_id_ = id; }
     void set_poll_interval(uint32_t ms) { this->poll_interval_ms_ = ms; }
     void set_keepalive(bool v) { this->keepalive_ = v; }
 
@@ -71,7 +66,8 @@ class NukiProLock : public lock::Lock, public Component,
     void save_pairing_data();
     void load_pairing_data();
 
-    std::string pin_;
+    uint32_t pin_{0};
+    uint32_t device_id_{2020002};
     uint32_t poll_interval_ms_{100};
     bool keepalive_{true};
 
@@ -86,10 +82,10 @@ class NukiProLock : public lock::Lock, public Component,
     std::atomic<bool> pairing_mode_{false};
 
     BleScanner::Scanner scanner_;
-    NukiLock::NukiLock nuki_lock_;
+    std::unique_ptr<NukiLock::NukiLock> nuki_lock_;
     NukiLock::KeyTurnerState key_turner_state_;
 
-    ESPPreferenceObject pref_;
+    ESPPreferenceObject paired_pref_;
 };
 
 }  // namespace nuki_pro

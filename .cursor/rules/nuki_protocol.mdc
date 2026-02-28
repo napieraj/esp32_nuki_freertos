@@ -1,0 +1,36 @@
+---
+description: Reference for the Nuki Smart Lock Bluetooth API v3.x+, including Gen 5 (Ultra) flows, cryptography, and passive state tracking.
+globs: *nuki*.cpp, *nuki*.h, *crypto*.cpp, *ble*.cpp
+---
+# Nuki BLE API Guidelines
+
+## 1. Protocol Versioning & Service UUIDs
+
+- **Gen 1-4 (Legacy/Standard):** Keyturner Service `a92ee200-5501-11e4-916c-0800200c9a66`. Pairing is `a92ee100-...`.
+- **Gen 5 Ultra / Firmware 5.x.x+:** Uses the "Ultra" protocol. Service UUID is `a92ee300-...` (and `a92ee400` for pairing).
+- **Ultra Authorization Flow:** Gen 5 pairing bypasses the older Challenge flow. Expect `Authorization Info (0x004C)` and an immediate switch to encrypted communication for `Authorization Data (0x0006)`.
+
+## 2. Cryptography (NaCl / libsodium)
+
+- **Algorithms:** Curve25519 (DH), HSalsa20 (KDF), XSalsa20Poly1305 (AEAD).
+- **Integrity:** Always append and verify CRC-CCITT (Polynomial `0x1021`, Initial `0xFFFF`). Nuki multi-byte payloads are strictly **Little-Endian**.
+- **Nonce Management:** 24-byte Nonce. Must STRICTLY increment. **NEVER reuse a nonce with the same secret key.** Persist the nonce counter safely across ESP32 reboots.
+
+## 3. Data Framing
+
+All encrypted BLE writes happen via the General Data Input Output Characteristic.
+
+- **ADATA (Unencrypted Header):** Nonce (24 bytes), Auth ID (4 bytes), Length (2 bytes).
+- **PDATA (Encrypted Payload):** Command ID (2 bytes), Payload Data (N bytes), CRC (2 bytes).
+
+## 4. Key Commands Reference
+
+- `0x0001`: Request Data
+- `0x0003`: Public Key / `0x0004`: Challenge / `0x0005`: Authorization Authenticator
+- `0x000C`: Keyturner States (Triggered via Indication on state change. Bit 0 = Critical Battery, Bit 1 = Charging, Bits 2-7 = Battery %).
+- `0x000D`: Lock Action (`1` = Unlock, `2` = Lock, `3` = Unlatch, `4` = Lock 'n' Go).
+
+## 5. Passive State Tracking (Battery Optimization)
+
+- Do NOT actively poll the lock to save Nuki battery.
+- Track the iBeacon RSSI/TX power byte. It rests at `-60 (0xC4)` and flips to `-59 (0xC5)` on a state change. Trigger a connection only when `0xC5` is detected to fetch `0x000C`.

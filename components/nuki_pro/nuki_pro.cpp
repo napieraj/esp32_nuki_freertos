@@ -89,7 +89,7 @@ void NukiProLock::setup() {
     // BLE task → Core 0 (NimBLE affinity, isolated from LwIP on Core 1)
     BaseType_t res = xTaskCreatePinnedToCore(
         NukiProLock::nuki_task_runner, "nukiBLE",
-        8192, this, 5, &this->task_handle_, 0);
+        10240, this, 5, &this->task_handle_, 0);
 
     if (res != pdPASS) {
         ESP_LOGE(TAG, "BLE task creation failed");

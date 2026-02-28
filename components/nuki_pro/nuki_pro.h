@@ -48,7 +48,7 @@ class NukiProLock : public lock::Lock, public Component,
     void setup() override;
     void loop() override;
     void dump_config() override;
-    float get_setup_priority() const override { return setup_priority::HARDWARE; }
+    float get_setup_priority() const override { return setup_priority::BLUETOOTH; }
 
     void notify(Nuki::EventType event_type) override;
 

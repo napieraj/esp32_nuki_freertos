@@ -49,7 +49,7 @@ void NukiProLock::setup() {
 
     // Construct NukiLock with configurable device ID (deferred from ctor
     // because NukiBle has no deviceId setter — must wait for set_device_id())
-    this->nuki_lock_ = std::make_unique<NukiLock::NukiLock>("NukiESPHome", this->device_id_);
+    this->nuki_lock_ = std::make_unique<NukiLock::NukiLock>("NukiESPHome", this->nuki_id_);
     this->nuki_lock_->setEventHandler(this);
 
     this->scanner_.initialize("ESPHomeNuki", true, 40, 40);
@@ -333,7 +333,7 @@ void NukiProLock::do_pair() {
 void NukiProLock::dump_config() {
     ESP_LOGCONFIG(TAG, "Nuki 5.0 Pro:");
     ESP_LOGCONFIG(TAG, "  PIN: %06u", this->pin_);
-    ESP_LOGCONFIG(TAG, "  Device ID: %u", this->device_id_);
+    ESP_LOGCONFIG(TAG, "  Nuki ID: %u", this->nuki_id_);
     ESP_LOGCONFIG(TAG, "  Poll: %u ms", this->poll_interval_ms_);
     ESP_LOGCONFIG(TAG, "  Keepalive: %s", YESNO(this->keepalive_));
     ESP_LOGCONFIG(TAG, "  Paired: %s", YESNO(this->paired_.load()));

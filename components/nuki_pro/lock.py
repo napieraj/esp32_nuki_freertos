@@ -20,7 +20,7 @@ NukiProLock = nuki_pro_ns.class_("NukiProLock", lock.Lock, cg.Component)
 
 CONF_POLL_INTERVAL = "poll_interval"
 CONF_KEEPALIVE = "keepalive"
-CONF_DEVICE_ID = "device_id"
+CONF_NUKI_ID = "nuki_id"
 
 
 def validate_pin(value):
@@ -32,7 +32,7 @@ def validate_pin(value):
 
 CONFIG_SCHEMA = lock.lock_schema(NukiProLock).extend({
     cv.Required(CONF_PIN): validate_pin,
-    cv.Optional(CONF_DEVICE_ID, default=2020002): cv.uint32_t,
+    cv.Optional(CONF_NUKI_ID, default=2020002): cv.uint32_t,
     cv.Optional(CONF_POLL_INTERVAL, default="100ms"): cv.positive_time_period_milliseconds,
     cv.Optional(CONF_KEEPALIVE, default=True): cv.boolean,
 }).extend(cv.COMPONENT_SCHEMA)
@@ -43,7 +43,7 @@ async def to_code(config):
     await cg.register_component(var, config)
 
     cg.add(var.set_pin(int(config[CONF_PIN])))
-    cg.add(var.set_device_id(config[CONF_DEVICE_ID]))
+    cg.add(var.set_nuki_id(config[CONF_NUKI_ID]))
     cg.add(var.set_poll_interval(config[CONF_POLL_INTERVAL]))
     cg.add(var.set_keepalive(config[CONF_KEEPALIVE]))
 

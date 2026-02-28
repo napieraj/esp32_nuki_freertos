@@ -41,7 +41,7 @@ class NukiProLock : public lock::Lock, public Component,
     }
 
     void set_pin(uint32_t pin) { this->pin_ = pin; }
-    void set_device_id(uint32_t id) { this->device_id_ = id; }
+    void set_nuki_id(uint32_t id) { this->nuki_id_ = id; }
     void set_poll_interval(uint32_t ms) { this->poll_interval_ms_ = ms; }
     void set_keepalive(bool v) { this->keepalive_ = v; }
 
@@ -67,7 +67,7 @@ class NukiProLock : public lock::Lock, public Component,
     void load_pairing_data();
 
     uint32_t pin_{0};
-    uint32_t device_id_{2020002};
+    uint32_t nuki_id_{2020002};
     uint32_t poll_interval_ms_{100};
     bool keepalive_{true};
 

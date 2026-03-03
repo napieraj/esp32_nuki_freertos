@@ -28,11 +28,19 @@ void NukiProLock::save_pairing_data() {
     }
 }
 
-void NukiProLock::load_pairing_data() {
-    bool paired = false;
-    if (this->paired_pref_.load(&paired)) {
-        ESP_LOGD(TAG, "Restored pairing data (paired=%s)", YESNO(paired));
+bool NukiProLock::load_pairing_data(bool *paired) {
+    if (paired == nullptr) {
+        return false;
     }
+
+    bool restored = false;
+    if (this->paired_pref_.load(&restored)) {
+        *paired = restored;
+        ESP_LOGD(TAG, "Loaded pairing preference (paired=%s)", YESNO(restored));
+        return true;
+    }
+
+    return false;
 }
 
 // ── Setup (Core 1) ────────────────────────────────────────────────────
@@ -45,7 +53,8 @@ void NukiProLock::setup() {
 
     // 2026 preference API: collision-free entity-scoped storage (version 1)
     this->paired_pref_ = this->make_entity_preference<bool>(1);
-    this->load_pairing_data();
+    bool stored_paired = false;
+    bool has_stored_pairing = this->load_pairing_data(&stored_paired);
 
     // Construct NukiLock with configurable device ID (deferred from ctor
     // because NukiBle has no deviceId setter — must wait for set_device_id())
@@ -69,14 +78,33 @@ void NukiProLock::setup() {
     this->nuki_lock_->setConnectRetries(BLE_CONNECT_RETRIES);
     this->nuki_lock_->setDisconnectTimeout(BLE_DISCONNECT_TIMEOUT);
 
-    this->paired_.store(this->nuki_lock_->isPairedWithLock());
+    bool runtime_paired = this->nuki_lock_->isPairedWithLock();
+    if (has_stored_pairing) {
+        if (stored_paired != runtime_paired) {
+            ESP_LOGW(
+                TAG,
+                "Pairing state mismatch (stored=%s runtime=%s); trusting runtime",
+                YESNO(stored_paired), YESNO(runtime_paired));
+        } else {
+            ESP_LOGD(TAG, "Pairing state consistent (paired=%s)", YESNO(runtime_paired));
+        }
+    } else {
+        ESP_LOGD(TAG, "No stored pairing preference; using runtime lock state");
+    }
 
-    if (this->paired_.load()) {
+    this->paired_.store(runtime_paired);
+    this->connected_.store(false);
+    this->pairing_mode_.store(!runtime_paired);
+    this->status_poll_requested_.store(runtime_paired);
+
+    if (!has_stored_pairing || stored_paired != runtime_paired) {
+        this->save_pairing_data();
+    }
+
+    if (runtime_paired) {
         ESP_LOGI(TAG, "Already paired");
-        this->status_poll_requested_.store(true);
     } else {
         ESP_LOGI(TAG, "Not paired — entering pairing mode");
-        this->pairing_mode_.store(true);
     }
 
     this->command_queue_ = xQueueCreate(10, sizeof(NukiCommand));

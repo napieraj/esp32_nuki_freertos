@@ -64,7 +64,7 @@ class NukiProLock : public lock::Lock, public Component,
     void do_status_poll();
     void do_pair();
     void save_pairing_data();
-    void load_pairing_data();
+    bool load_pairing_data(bool *paired);
 
     uint32_t pin_{0};
     uint32_t nuki_id_{2020002};

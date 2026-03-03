@@ -4,6 +4,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENV_DIR="${REPO_ROOT}/.venv"
 ESPHOME_REF="${ESPHOME_REF:-dev}"
+ESPHOME_PREWARM_COMPILE="${ESPHOME_PREWARM_COMPILE:-1}"
+ESPHOME_PREWARM_CONFIG="${ESPHOME_PREWARM_CONFIG:-nuki-lock-test.yaml}"
 
 info()  { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()    { printf '\033[1;32m==> %s\033[0m\n' "$*"; }
@@ -60,7 +62,15 @@ ruff version
 
 info "Validating ESPHome config..."
 cd "$REPO_ROOT"
-esphome config nuki-lock-test.yaml >/dev/null
+esphome config "$ESPHOME_PREWARM_CONFIG" >/dev/null
+
+if [ "$ESPHOME_PREWARM_COMPILE" = "1" ]; then
+    info "Prewarming PlatformIO/ESP-IDF toolchain via compile..."
+    info "This is expected to take ~60s on first run."
+    esphome compile "$ESPHOME_PREWARM_CONFIG" >/dev/null
+else
+    warn "Skipping compile prewarm (ESPHOME_PREWARM_COMPILE=${ESPHOME_PREWARM_COMPILE})."
+fi
 
 ok "Setup complete!"
 echo ""
@@ -70,5 +80,5 @@ echo "  Compile firmware:   make compile"
 echo "  Lint all:           make lint"
 echo "  See all targets:    make help"
 echo ""
-echo "  First compile downloads the ESP32-S3 toolchain (~60s)."
-echo "  Subsequent builds take ~5s."
+echo "  Setup now prewarms the ESP32-S3 toolchain by default."
+echo "  Disable prewarm:    ESPHOME_PREWARM_COMPILE=0 make setup"

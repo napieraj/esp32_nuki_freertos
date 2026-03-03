@@ -70,7 +70,7 @@ async def to_code(config):
     # NOTE: USE_ETHERNET is defined by the ethernet component itself;
     # we intentionally do NOT set it here so the lock component
     # remains compatible with WiFi-only configurations.
-    add_idf_sdkconfig_option("CONFIG_LWIP_TCPIP_TASK_AFFINITY", 1)
+    add_idf_sdkconfig_option("CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1", True)
 
     # ── Selective compilation: keep IDF components for PoE boards ──
     # Prevents build from stripping network/storage drivers that

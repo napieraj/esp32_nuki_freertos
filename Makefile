@@ -10,8 +10,12 @@ CXX_SRC:= components/nuki_pro/*.cpp components/nuki_pro/*.h
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 .PHONY: setup
-setup: ## Create venv and install ESPHome + dev tools
+setup: ## Create venv, install tools, and warm compile cache
 	@script/setup
+
+.PHONY: setup-fast
+setup-fast: ## Create venv and install tools (skip cache warm compile)
+	@ESPHOME_WARM_COMPILE=0 script/setup
 
 # ── Build & validate ──────────────────────────────────────────────────────────
 

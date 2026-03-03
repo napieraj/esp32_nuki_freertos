@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENV_DIR="${REPO_ROOT}/.venv"
 ESPHOME_REF="${ESPHOME_REF:-dev}"
+ESPHOME_WARM_COMPILE="${ESPHOME_WARM_COMPILE:-1}"
 
 info()  { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()    { printf '\033[1;32m==> %s\033[0m\n' "$*"; }
@@ -56,19 +57,33 @@ info "Verifying installation..."
 esphome version
 ruff version
 
-# ── Validate config ──────────────────────────────────────────────────────────
+# ── Validate config and warm build cache ────────────────────────────────────
 
 info "Validating ESPHome config..."
 cd "$REPO_ROOT"
 esphome config nuki-lock-test.yaml >/dev/null
+
+if [ "$ESPHOME_WARM_COMPILE" = "1" ]; then
+    info "Warming ESPHome/PlatformIO cache with compile..."
+    esphome compile nuki-lock-test.yaml >/dev/null
+    ok "Compile cache warmed (toolchain + managed components)."
+else
+    warn "Skipping compile cache warm-up (ESPHOME_WARM_COMPILE=${ESPHOME_WARM_COMPILE})."
+fi
 
 ok "Setup complete!"
 echo ""
 echo "  Activate the venv:  source .venv/bin/activate"
 echo "  Validate config:    make config"
 echo "  Compile firmware:   make compile"
+echo "  Fast setup only:    ESPHOME_WARM_COMPILE=0 make setup"
 echo "  Lint all:           make lint"
 echo "  See all targets:    make help"
 echo ""
-echo "  First compile downloads the ESP32-S3 toolchain (~60s)."
-echo "  Subsequent builds take ~5s."
+if [ "$ESPHOME_WARM_COMPILE" = "1" ]; then
+    echo "  Setup prewarmed the ESP32-S3 toolchain and build dependencies."
+    echo "  Subsequent builds should be incremental (~5s)."
+else
+    echo "  First compile downloads the ESP32-S3 toolchain (~60s)."
+    echo "  Subsequent builds take ~5s."
+fi

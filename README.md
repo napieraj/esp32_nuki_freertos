@@ -59,11 +59,14 @@ make compile    # cross-compile firmware for ESP32-S3
 
 **Prerequisites:** Python 3.12+ and `clang-format` (optional, for C++ formatting).
 
+`make setup` now pre-warms `esphome config` + `esphome compile` cache data so subsequent `make compile` calls avoid first-time toolchain download delays.
+
 ### Make targets
 
 | Target | Description |
 |--------|-------------|
-| `make setup` | Create venv and install ESPHome + dev tools |
+| `make setup` | Create venv, install tools, and warm compile cache |
+| `make setup-fast` | Setup only (skip warm compile cache) |
 | `make config` | Validate ESPHome YAML config |
 | `make compile` | Compile firmware for ESP32-S3 |
 | `make lint` | Run all linters (ruff + clang-format) |

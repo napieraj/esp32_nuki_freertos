@@ -59,11 +59,15 @@ make compile    # cross-compile firmware for ESP32-S3
 
 **Prerequisites:** Python 3.12+ and `clang-format` (optional, for C++ formatting).
 
+`make setup` now runs a one-time compile prewarm so Cursor Cloud/devcontainer
+environments already have PlatformIO + ESP-IDF toolchains installed.
+Set `ESPHOME_PREWARM_COMPILE=0` to skip prewarm.
+
 ### Make targets
 
 | Target | Description |
 |--------|-------------|
-| `make setup` | Create venv and install ESPHome + dev tools |
+| `make setup` | Create venv, install ESPHome dev tools, prewarm toolchains |
 | `make config` | Validate ESPHome YAML config |
 | `make compile` | Compile firmware for ESP32-S3 |
 | `make lint` | Run all linters (ruff + clang-format) |

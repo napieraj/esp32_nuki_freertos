@@ -6,6 +6,10 @@ Threaded ESPHome external component (`nuki_pro`) for Nuki 5.0 Pro smart lock on 
 
 ## Cursor Cloud specific instructions
 
+### Environment
+
+All commands must run inside the venv: `source /workspace/.venv/bin/activate` (or prefix with `/workspace/.venv/bin/`). ESPHome (dev branch), PlatformIO, ruff, and clang-format are pre-installed by the update script. The ESP-IDF toolchain and IDF component dependencies are cached in `/workspace/.esphome/` after the first compile — incremental builds are fast (~5s).
+
 ### Build
 
 ```bash
@@ -18,6 +22,13 @@ First build downloads the ESP32-S3 toolchain (~60s). Incremental builds take ~5s
 
 ```bash
 esphome config nuki-lock-test.yaml
+```
+
+### Lint
+
+```bash
+ruff check components/nuki_pro/*.py
+clang-format --dry-run --Werror components/nuki_pro/*.cpp components/nuki_pro/*.h
 ```
 
 ### Key files

@@ -44,3 +44,45 @@ lock:
 - ESP32-S3 (dual-core) with ESP-IDF framework
 - PSRAM recommended
 - Nuki 5.0 Pro / Ultra / 5th Gen smart lock
+
+## Development
+
+### Quick start
+
+```bash
+git clone https://github.com/napieraj/esp32_nuki_freertos.git
+cd esp32_nuki_freertos
+make setup      # creates .venv, installs ESPHome dev + tools
+make config     # validate YAML
+make compile    # cross-compile firmware for ESP32-S3
+```
+
+**Prerequisites:** Python 3.12+ and `clang-format` (optional, for C++ formatting).
+
+### Make targets
+
+| Target | Description |
+|--------|-------------|
+| `make setup` | Create venv and install ESPHome + dev tools |
+| `make config` | Validate ESPHome YAML config |
+| `make compile` | Compile firmware for ESP32-S3 |
+| `make lint` | Run all linters (ruff + clang-format) |
+| `make format` | Auto-format all source files |
+| `make clean` | Remove build artifacts (keeps venv) |
+| `make clean-all` | Remove build artifacts, venv, and toolchain cache |
+
+### VS Code / Codespaces
+
+Open in a [dev container](https://containers.dev/) for a zero-config environment — `script/setup` runs automatically on creation.
+
+### Manual setup
+
+If you prefer not to use `make`:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install "esphome @ git+https://github.com/esphome/esphome.git@dev" ruff
+esphome config nuki-lock-test.yaml   # validate
+esphome compile nuki-lock-test.yaml  # build
+```

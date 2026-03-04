@@ -22,7 +22,7 @@ control() ──→ queue ────→   ├─ command? → execute instantl
 - **`xQueueReceive` hybrid engine**: The queue timeout IS the poll interval (100ms default). Commands from HA arrive with 0ms latency. Timeouts trigger status polls.
 - **Lock-free state exchange**: `std::atomic` for pending state — no mutex, no priority inversion.
 - **PIN as string**: 6-digit PIN preserved with leading zeros (`"065432"` stays `065432`).
-- **Keep-alive polling**: Constant 100ms cycle keeps the BLE connection warm for instant actions.
+- **Keepalive behavior**: Commands wake instantly via queue events; when idle, an 8-second keepalive pulse prevents Nuki BLE session timeout.
 
 ## Usage
 

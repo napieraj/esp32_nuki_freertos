@@ -8,7 +8,7 @@ Threaded ESPHome external component (`nuki_pro`) for Nuki 5.0 Pro smart lock on 
 
 ### Environment
 
-All commands must run inside the venv: `source /workspace/.venv/bin/activate` (or prefix with `/workspace/.venv/bin/`). ESPHome (dev branch), PlatformIO, ruff, and clang-format are pre-installed by the update script. The ESP-IDF toolchain and IDF component dependencies are cached in `/workspace/.esphome/` after the first compile — incremental builds are fast (~5s).
+All commands must run inside the venv: `source /workspace/.venv/bin/activate` (or prefix with `/workspace/.venv/bin/`). ESPHome (dev branch), PlatformIO, ruff, and clang-format are pre-installed by the update script. The setup script now warms `esphome config` + `esphome compile` cache data for `nuki-lock-test.yaml`, so incremental builds are fast (~5s) for new agents.
 
 ### Build
 
@@ -16,7 +16,7 @@ All commands must run inside the venv: `source /workspace/.venv/bin/activate` (o
 esphome compile nuki-lock-test.yaml
 ```
 
-First build downloads the ESP32-S3 toolchain (~60s). Incremental builds take ~5s.
+If setup cache warming is skipped (`ESPHOME_WARM_COMPILE=0`), first compile downloads the ESP32-S3 toolchain (~60s). Incremental builds take ~5s.
 
 ### Validate YAML
 
@@ -50,5 +50,5 @@ clang-format --dry-run --Werror components/nuki_pro/*.cpp components/nuki_pro/*.
 - PIN is a 6-digit string in YAML, parsed to `uint32_t` in Python codegen — zero runtime string parsing
 - `nuki_id` configurable in YAML (default 2020002) for multi-lock deployments
 - Pairing persistence uses `make_entity_preference<bool>(1)` — versioned, collision-free
-- LwIP pinned to Core 1 (`CONFIG_LWIP_TCPIP_TASK_AFFINITY=1`) to isolate BLE from network jitter
+- LwIP pinned to Core 1 (`CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y`) to isolate BLE from network jitter
 - 8-second keepalive pulse keeps BLE session warm without flooding the radio

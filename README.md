@@ -30,7 +30,7 @@ control() ──→ queue ────→   ├─ command? → execute instantl
 external_components:
   - source:
       type: local
-      path: custom_components
+      path: components
 
 lock:
   - platform: nuki_pro
@@ -59,15 +59,16 @@ make compile    # cross-compile firmware for ESP32-S3
 
 **Prerequisites:** Python 3.12+ and `clang-format` (optional, for C++ formatting).
 
-`make setup` now runs a one-time compile prewarm so Cursor Cloud/devcontainer
-environments already have PlatformIO + ESP-IDF toolchains installed.
-Set `ESPHOME_PREWARM_COMPILE=0` to skip prewarm.
+`make setup` now pre-warms `esphome config` + `esphome compile` cache data so
+subsequent `make compile` calls avoid first-time toolchain download delays.
+Set `ESPHOME_WARM_COMPILE=0` to skip warm-up.
 
 ### Make targets
 
 | Target | Description |
 |--------|-------------|
-| `make setup` | Create venv, install ESPHome dev tools, prewarm toolchains |
+| `make setup` | Create venv, install tools, and warm compile cache |
+| `make setup-fast` | Setup only (skip warm compile cache) |
 | `make config` | Validate ESPHome YAML config |
 | `make compile` | Compile firmware for ESP32-S3 |
 | `make lint` | Run all linters (ruff + clang-format) |

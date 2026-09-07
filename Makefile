@@ -73,6 +73,7 @@ test-host: ## Build and run the pure-C UART framing tests with the host gcc
 	gcc -std=c99 -Wall -Wextra -Werror -Icomponents/nuki_uart_bridge \
 		tests/test_uart_framing.c -o $(TEST_BUILD)/test_uart_framing
 	$(TEST_BUILD)/test_uart_framing
+	gcc -std=c99 -Wall -Wextra -Werror -Icomponents/nuki_uart_bridge tests/test_uart_entries.c -o $(TEST_BUILD)/test_uart_entries && $(TEST_BUILD)/test_uart_entries
 
 .PHONY: test-seclink
 test-seclink: ## Build and run the sec_link (libsodium) transcript tests with the host g++

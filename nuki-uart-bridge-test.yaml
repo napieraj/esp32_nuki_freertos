@@ -1,5 +1,5 @@
 esphome:
-  name: nuki-uart-bridge
+  name: nuki-uart-bridge-r4a
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -16,27 +16,22 @@ ethernet:
   reset_pin: GPIO14
 
 api:
+  custom_services: true
+  homeassistant_services: true
 
 logger:
-  baud_rate: 0  # keep UART0 free of log traffic when the bridge is on UART0
+  baud_rate: 0
 
 external_components:
   - source:
       type: local
-      path: components
+      path: /home/user/esp32_nuki_freertos/components
 
-# UART to the XIAO nRF52840 bridge (D6/P1.11 = nRF TX, D7/P1.12 = nRF RX).
-# 921600 8N1 is the bridge default; use 115200 if the overlay is built with
-# the fallback rate.  A larger RX buffer absorbs bursts (state change +
-# diagnostics) between two ESPHome loop() iterations.
 uart:
   id: nuki_uart
   tx_pin: GPIO17
   rx_pin: GPIO18
   baud_rate: 921600
-  data_bits: 8
-  parity: NONE
-  stop_bits: 1
   rx_buffer_size: 1024
 
 lock:
@@ -44,36 +39,41 @@ lock:
     id: front_door
     name: "Front Door Nuki"
     uart_id: nuki_uart
-    pin: "065432"          # optional; required to pair an Ultra / 5th gen
-    device_type: auto      # auto | classic | ultra
-    pair_as: app           # app | bridge
-    link_profile: armed    # armed (low latency) | eco
-    # app_id: 2020002      # optional; bridge default when omitted
-    poll_interval: 60s     # REQ_LOCK_STATE cadence; changes also arrive unsolicited
-    auto_pair: true        # send PAIR once at boot when the bridge is unpaired
+    security_pin: "065432"
+    device_type: auto
+    state_poll_interval: 30s
+    event: "nuki_event"
+    secure_link: auto
+    event_log_count: 5
     connected:
       name: "Front Door Nuki Connected"
-    rssi:
-      name: "Front Door Nuki RSSI"
-    diagnostics:
-      name: "Front Door Nuki Bridge Diagnostics"
-    on_pairing_complete:
+    last_unlock_user:
+      name: "Front Door Nuki Last Unlock User"
+    last_lock_action:
+      name: "Front Door Nuki Last Lock Action"
+    last_lock_action_trigger:
+      name: "Front Door Nuki Last Lock Action Trigger"
+    door_sensor:
+      name: "Front Door"
+    door_sensor_state:
+      name: "Front Door Sensor State"
+    tamper:
+      name: "Front Door Sensor Tamper"
+    on_event_log:
       - logger.log:
-          format: "Paired with Nuki, auth_id=%u"
-          args: ["auth_id"]
-    on_state_change:
+          format: "log #%u type 0x%02X auth %u '%s'"
+          args: ["entry.index", "entry.type", "entry.auth_id", "entry.name"]
+    on_door_state:
       - logger.log:
-          format: "Nuki lock state byte 0x%02X"
-          args: ["lock_state"]
+          format: "door state 0x%02X"
+          args: ["door_state"]
 
 button:
   - platform: template
-    name: "Front Door Nuki Pair"
-    entity_category: config
+    name: "Front Door Nuki Keypad List"
     on_press:
-      - lambda: id(front_door).pair();
+      - lambda: id(front_door).print_keypad_entries();
   - platform: template
-    name: "Front Door Nuki Diagnostics Refresh"
-    entity_category: diagnostic
+    name: "Front Door Nuki Fetch Logs"
     on_press:
-      - lambda: id(front_door).request_diagnostics();
+      - lambda: id(front_door).request_event_logs(10);

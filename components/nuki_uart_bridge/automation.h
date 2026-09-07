@@ -24,5 +24,25 @@ public:
   }
 };
 
+/// Fires for every new Log Entry (index above the last one seen);
+/// x = parsed nuki_log_entry_t (index, ts, auth_id, name, type, data).
+class EventLogTrigger : public Trigger<nuki_log_entry_t> {
+public:
+  explicit EventLogTrigger(NukiUartBridgeLock *parent) {
+    parent->add_on_event_log_callback(
+        [this](nuki_log_entry_t entry) { this->trigger(entry); });
+  }
+};
+
+/// Fires when the Keyturner States door sensor byte changes; x = raw state
+/// (0x02 closed, 0x03 opened, 0xF0 tampered, ... spec p.32).
+class DoorStateTrigger : public Trigger<uint8_t> {
+public:
+  explicit DoorStateTrigger(NukiUartBridgeLock *parent) {
+    parent->add_on_door_state_callback(
+        [this](uint8_t state) { this->trigger(state); });
+  }
+};
+
 } // namespace nuki_uart_bridge
 } // namespace esphome

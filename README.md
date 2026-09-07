@@ -83,29 +83,143 @@ lock:
     id: front_door
     name: "Front Door Nuki"
     uart_id: nuki_uart
-    pin: "065432"        # optional 6-digit security PIN (mandatory to pair an Ultra/5th gen)
+    security_pin: "065432"  # 4-6 digits, leading zeros kept; needed to pair an Ultra and
+                            # for every keypad / event-log command (`pin:` is the old name)
     device_type: auto    # auto | classic | ultra  (PAIR payload device_type)
     pair_as: app         # app | bridge            (Authorization Data ID type)
     link_profile: armed  # armed (7.5 ms interval, latency 0) | eco
     app_id: 2020002      # optional fixed App/Bridge-ID; omitted = bridge picks one
     poll_interval: 60s   # periodic REQ_LOCK_STATE; state normally arrives unsolicited
     auto_pair: true      # send PAIR once at boot if the bridge reports no credentials
+    secure_link: auto    # auto | true | false — sealed UART transport (see below)
+    state_poll_interval: 60s  # bridge-side Keyturner States read cadence (SET_STATE_POLL 0x7A)
+    event: nuki_event    # fire `esphome.nuki_event` in HA for every new log entry; "none" = off
+    event_log_count: 5   # newest entries fetched after each lock/unlock/door change (1-50)
     connected:           # optional binary_sensor: bridge BLE state == CONNECTED
       name: "Front Door Nuki Connected"
     rssi:                # optional sensor (dBm), from CONN_STATUS events
       name: "Front Door Nuki RSSI"
     diagnostics:         # optional text_sensor summarising REQ_DIAGNOSTICS
       name: "Front Door Nuki Bridge Diagnostics"
+    last_unlock_user:    # text_sensor: authorization name of the newest lock/keypad log entry
+      name: "Front Door Nuki Last Unlock User"
+    last_lock_action:    # text_sensor: Keyturner States "last lock action" (Unlock, Lock, ...)
+      name: "Front Door Nuki Last Lock Action"
+    last_lock_action_trigger:  # text_sensor: its trigger (system, manual, button, autoLock, ...)
+      name: "Front Door Nuki Last Lock Action Trigger"
+    door_sensor:         # binary_sensor (door): 0x03 opened = ON, 0x02 closed = OFF, else unavailable
+      name: "Front Door"
+    door_sensor_state:   # text_sensor with the spec names (doorClosed, doorOpened, uncalibrated, tampered, ...)
+      name: "Front Door Sensor State"
+    tamper:              # binary_sensor (tamper): ON while the door sensor reports 0xF0 Tampered
+      name: "Front Door Sensor Tamper"
     on_pairing_complete: # x = auth_id (uint32)
       - logger.log: "paired"
     on_state_change:     # x = raw Nuki lock state byte (spec p.31)
       - logger.log: "state changed"
+    on_event_log:        # entry = nuki_log_entry_t (index, ts, auth_id, name, type, data[])
+      - logger.log:
+          format: "log #%u type 0x%02X by %s"
+          args: ["entry.index", "entry.type", "entry.name"]
+    on_door_state:       # door_state = raw door sensor byte (spec p.32)
+      - logger.log: "door changed"
 ```
 
 Lambda-callable helpers: `id(front_door).pair()`, `.unpair()` (sends the
 PIN if configured so the bridge can remove its authorization from the
 lock), `.request_diagnostics()`, `.request_lock_state()`,
-`.set_runtime_link_profile(0|1)`.  `lock.open` maps to UNLATCH.
+`.set_runtime_link_profile(0|1)`, `.set_runtime_state_poll(seconds)`,
+`.request_event_logs(n)`, `.print_keypad_entries()`,
+`.add_keypad_entry(name, code)`, `.update_keypad_entry(id, name, code,
+enabled)`, `.delete_keypad_entry(id)`, `.pair_host()` / `.unpair_host()`
+(secure link).  `lock.open` maps to UNLATCH.
+
+### Keypad, event log and door sensor
+
+These need `security_pin` (the lock demands the PIN for every keypad and
+log command) and, for the Home Assistant services, `api: custom_services:
+true`; events additionally need `api: homeassistant_services: true`.
+
+| HA service (`esphome.<node>_…`) | Arguments | UART command sent |
+|---------------------------------|-----------|-------------------|
+| `add_keypad_entry` | `name` (1-20 chars), `code` (6 digits, no 0) | `0x50 ADD_KEYPAD` = Add Keypad Code 0x0041 fields (code, name, time-limited block zeroed) + PIN |
+| `update_keypad_entry` | `id`, `name`, `code`, `enabled` | `0x53 UPDATE_KEYPAD` = Update Keypad Code 0x0046 + PIN |
+| `delete_keypad_entry` | `id` | `0x54 REMOVE_KEYPAD` = Remove Keypad Code 0x0047 + PIN |
+| `print_keypad_entries` | – | `0x51 REQ_KEYPAD_CODES` (offset 0, count 0xFFFF) + PIN; every `0x89` entry is logged (id, name, enabled, lock count, dates — never the code) |
+| `request_event_logs` | `count` (1-50) | `0x40 REQ_LOG_ENTRIES` (start 0, descending, no count frame) + PIN; every `0x88` entry is parsed |
+| `pair_host` | – | secure-link bootstrap, see below |
+
+Payloads follow the bridge rule "spec fields minus nK, PIN last": the PIN
+container is `uint16` on gen 1-4 and `uint32` on Ultra (spec p.16) and the
+width is picked when the command is sent from the `device_type` the
+bridge reports in diagnostics (falling back to the configured one).  A
+4-6 digit PIN string is accepted; leading zeros are kept in YAML and
+encoded numerically.  Example, `add_keypad_entry("Guest", 123456)` on an
+Ultra with PIN 065432, SEQ 7:
+
+```
+payload  40 E2 01 00 | "Guest" + 15 x 00 | 00 | 19 x 00 | 98 FF 00 00
+         code 123456 LE   name[20]         tl   limits    PIN 65432 LE32
+frame    50 07 00 <payload> CRC   →  wire 00 03 50 07 04 40 E2 01 06 47 75 65 73 74 01 … 03 98 FF 01 03 DE 21 00
+```
+
+Event log pipeline: after every settled lock state change and every door
+sensor change the host waits 2 s and fetches the newest
+`event_log_count` entries (also `request_event_logs(n)` on demand).  The
+bridge streams them as `0x88` frames, one Log Entry 0x0032 each (index,
+lock timestamp, auth id, name, type, data — length-driven, spec pp.50-52).
+For every entry whose index is above the last one seen the component
+fires `esphome.<event>` with the same keys as the NukiBleEsp32-based
+ESPHome component (`index`, `authorizationId`, `authorizationName`,
+`timeYear`…`timeSecond`, `type`, `action`, `trigger`, `completionStatus`,
+`codeId`) plus an ISO `timestamp` taken from the lock's own clock — so
+door-sensor entries (type 0x06: `DoorOpened` / `DoorClosed` /
+`SensorJammed` / `SensorTampered`) and keypad entries are timed exactly
+even though they are fetched by polling — and runs `on_event_log`.
+Entries arrive newest first; on the first fetch after boot every entry of
+the batch fires.  `last_unlock_user` is the name of the newest lock/keypad
+entry, resolved through the authorization list (`0x30 REQ_AUTH_ENTRIES`
+→ `0x87` stream, fetched once per connection and refreshed every 6 h),
+then the name inside the entry, then `Manual`; a Keyturner States with
+trigger `manual` also sets it to `Manual`.
+
+Door sensor: the Keyturner States byte 18 feeds `door_sensor`,
+`door_sensor_state`, `tamper` and `on_door_state`.  The 1.0-2.0 and
+3.0-Ultra value sets do not overlap, so one table names both
+(`unavailable`, `deactivated`, `doorClosed`, `doorOpened`,
+`doorStateUnknown`, `calibrating`, `uncalibrated`, `tampered`, `unknown`).
+The bridge emits `0x85` whenever the door sensor byte changes, but a
+closed door only becomes visible when the bridge next reads the state:
+`state_poll_interval` (sent as `SET_STATE_POLL 0x7A [seconds LE16]` after
+HELLO, `0` = leave the bridge default) sets that cadence and is the
+door-sensor freshness bound.
+
+### Secure link (`secure_link`)
+
+The bridge's Phase 3 firmware seals the UART (X25519 static + ephemeral
+keys, BLAKE2b key schedule, XChaCha20-Poly1305, per-direction counters;
+`components/nuki_uart_bridge/nuki_uart_seclink.*`, byte-exact against the
+bridge's `tests/sec_link_vectors.txt` via `make test-seclink`).  The host
+keeps its static key pair and the bridge's public key in ESPHome
+preferences (keyed by the lock entity).
+
+* `auto` (default): use it when the HELLO caps announce it (`0x0020`);
+  older bridge firmware keeps working in plaintext.
+* `true`: refuse to talk to a bridge without it.  `false`: never seal.
+* First contact (bridge unpaired, caps without `0x0040`): the host sends
+  `PAIR_WINDOW 0x77 [120]` and its `[E3][pk]`; the bridge answers with its
+  key inside its pairing window (first boot, its button, or `0x77` while
+  unpaired) — trust on first use.  A bridge that already holds another
+  host's key is left alone: open its window and call `pair_host()`.
+* Every boot / bridge restart: HS_INIT → HS_RESP (retried 3× with
+  backoff); link profile, state poll, diagnostics and state requests are
+  held until the session is up.  From then on every command is an inner
+  `[cmd][seq][data]` sealed into `[E0][ctr][tag][ct]`, and every sealed
+  reply is opened and dispatched through the normal SEQ/ACK logic.
+  `0x82 [08]` re-runs the handshake; `0x82 [41]` stops and asks for a
+  re-pair.  `unpair_host()` wipes the bridge's copy of the host key.
+* Diagnostics v5 (`sec_state`, pairing window, `state_poll_interval_s`) is
+  parsed by version and length.
 
 See `nuki-uart-bridge-test.yaml` for a complete W5500 + template-button
 example.  Validate with `make config-uart`, build with `make compile-uart`.
@@ -117,7 +231,9 @@ example.  Validate with `make config-uart`, build with `make compile-uart`.
   `components/nuki_uart_bridge/nuki_uart_framing.h`; `make test-host` runs
   `tests/test_uart_framing.c` against COBS/CRC vectors, the worked HELLO
   and UNLOCK bytes from the bridge's `docs/host-integration.md`, and
-  round-trips.
+  round-trips, plus `tests/test_uart_entries.c` for the keypad / log /
+  authorization builders and parsers in `nuki_uart_entries.h` (hand-built
+  frames from the spec field tables — Nuki publishes no vectors for them).
 * Startup: HELLO `[0x7D][0x02][CRC]` is always sent **v1-framed**
   (`00 05 7D 02 48 43 00` on the wire); the `0x90` reply selects v2 and
   every later frame carries a monotonic SEQ starting at 1 (never 0).  A
@@ -182,7 +298,7 @@ Set `ESPHOME_WARM_COMPILE=0` to skip warm-up.
 | `make lint` | Run all linters (ruff + clang-format) |
 | `make config-uart` | Validate the UART-bridge YAML (`nuki-uart-bridge-test.yaml`) |
 | `make compile-uart` | Compile the UART-bridge firmware |
-| `make test-host` | Run the pure-C UART framing tests with the host gcc |
+| `make test-host` | Run the pure-C UART framing + entry parser tests with the host gcc |
 | `make format` | Auto-format all source files |
 | `make clean` | Remove build artifacts (keeps venv) |
 | `make clean-all` | Remove build artifacts, venv, and toolchain cache |

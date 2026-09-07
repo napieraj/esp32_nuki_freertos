@@ -1,5 +1,6 @@
 esphome:
   name: nuki-uart-bridge-r4a
+  friendly_name: "Front Door Nuki"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -22,10 +23,15 @@ api:
 logger:
   baud_rate: 0
 
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin
+
 external_components:
   - source:
       type: local
-      path: /home/user/esp32_nuki_freertos/components
+      path: components
 
 uart:
   id: nuki_uart
@@ -41,24 +47,81 @@ lock:
     uart_id: nuki_uart
     security_pin: "065432"
     device_type: auto
+    time_id: sntp_time            # daily Update Time 0x0021 (+ after every time sync)
     state_poll_interval: 30s
+    pairing_mode_timeout: 300s
+    allowed_actions: [unlock, lock, unlatch, lock_n_go, lock_n_go_unlatch]
+    action_suffix: "Home Assistant"  # <= 20 bytes; empty = the friendly name
     event: "nuki_event"
     secure_link: auto
     event_log_count: 5
     connected:
-      name: "Front Door Nuki Connected"
+      name: "Connected"
+    paired:
+      name: "Paired"
+    rssi:
+      name: "RSSI"
+    diagnostics:
+      name: "Bridge Diagnostics"
+    pin_status:
+      name: "PIN Status"
+    nuki_state:
+      name: "Nuki State"
+    firmware_version:
+      name: "Firmware Version"
+    hardware_version:
+      name: "Hardware Version"
+    lock_name:
+      name: "Lock Name"
+    nuki_id:
+      name: "Nuki ID"
+    keypad_paired:
+      name: "Keypad Paired"
+    battery_level:
+      name: "Battery"
+    battery_critical:
+      name: "Battery Critical"
+    battery_charging:
+      name: "Battery Charging"
+      disabled_by_default: true
+    keypad_battery_critical:
+      name: "Keypad Battery Critical"
+    door_sensor_battery_critical:
+      name: "Door Sensor Battery Critical"
     last_unlock_user:
-      name: "Front Door Nuki Last Unlock User"
+      name: "Last Unlock User"
     last_lock_action:
-      name: "Front Door Nuki Last Lock Action"
+      name: "Last Lock Action"
     last_lock_action_trigger:
-      name: "Front Door Nuki Last Lock Action Trigger"
+      name: "Last Lock Action Trigger"
+    last_lock_action_completion_status:
+      name: "Last Lock Action Completion Status"
+    night_mode:
+      name: "Night Mode"
     door_sensor:
       name: "Front Door"
     door_sensor_state:
-      name: "Front Door Sensor State"
+      name: "Door Sensor State"
+    door_security_state:
+      name: "Door Security State"
     tamper:
-      name: "Front Door Sensor Tamper"
+      name: "Door Sensor Tamper"
+    pairing_mode:
+      name: "Pairing Mode"
+    unpair:
+      name: "Unpair"
+    request_calibration:
+      name: "Calibrate"
+    reboot:
+      name: "Reboot Lock"
+    on_pairing_complete:
+      - logger.log:
+          format: "paired, auth id %u"
+          args: ["auth_id"]
+    on_pairing_mode_on:
+      - logger.log: "pairing mode on"
+    on_pairing_mode_off:
+      - logger.log: "pairing mode off"
     on_event_log:
       - logger.log:
           format: "log #%u type 0x%02X auth %u '%s'"
@@ -70,10 +133,50 @@ lock:
 
 button:
   - platform: template
-    name: "Front Door Nuki Keypad List"
+    name: "Keypad List"
     on_press:
       - lambda: id(front_door).print_keypad_entries();
   - platform: template
-    name: "Front Door Nuki Fetch Logs"
+    name: "Fetch Logs"
     on_press:
       - lambda: id(front_door).request_event_logs(10);
+  - platform: template
+    name: "Lock 'n' Go"
+    on_press:
+      - nuki_uart_bridge.lock_n_go:
+          id: front_door
+          unlatch: false
+          suffix: "ESPHome button"
+  - platform: template
+    name: "Verify PIN"
+    on_press:
+      - nuki_uart_bridge.verify_pin: front_door
+  - platform: template
+    name: "Update Lock Time"
+    on_press:
+      - nuki_uart_bridge.update_time: front_door
+  - platform: template
+    name: "Set PIN Override 123456"
+    on_press:
+      - nuki_uart_bridge.set_security_pin:
+          id: front_door
+          security_pin: 123456
+  - platform: template
+    name: "Pair (5 min window)"
+    on_press:
+      - if:
+          condition:
+            not:
+              nuki_uart_bridge.paired: front_door
+          then:
+            - nuki_uart_bridge.set_pairing_mode:
+                id: front_door
+                pairing_mode: true
+          else:
+            - logger.log: "already paired"
+  - platform: template
+    name: "Fob Action 1"
+    on_press:
+      - nuki_uart_bridge.lock_action:
+          id: front_door
+          action: fob_1

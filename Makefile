@@ -74,6 +74,14 @@ test-host: ## Build and run the pure-C UART framing tests with the host gcc
 		tests/test_uart_framing.c -o $(TEST_BUILD)/test_uart_framing
 	$(TEST_BUILD)/test_uart_framing
 
+.PHONY: test-seclink
+test-seclink: ## Build and run the sec_link (libsodium) transcript tests with the host g++
+	@mkdir -p $(TEST_BUILD)
+	g++ -std=c++17 -Wall -Wextra -Werror -Icomponents/nuki_uart_bridge \
+		tests/test_seclink_host.cpp components/nuki_uart_bridge/nuki_uart_seclink.cpp \
+		$$(pkg-config --cflags --libs libsodium) -o $(TEST_BUILD)/test_seclink_host
+	$(TEST_BUILD)/test_seclink_host
+
 # ── Clean ─────────────────────────────────────────────────────────────────────
 
 .PHONY: clean

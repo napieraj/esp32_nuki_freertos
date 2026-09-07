@@ -1,0 +1,37 @@
+name: host-tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang-format libsodium-dev pkg-config
+
+      - name: Tool venv (ESPHome + ruff, no compile cache)
+        run: make setup-fast
+
+      - name: Lint
+        run: make lint
+
+      - name: Validate ESPHome configs
+        run: |
+          make config
+          make config-uart
+
+      - name: UART framing tests
+        run: make test-host
+
+      - name: Secure-link transcript tests
+        run: make test-seclink

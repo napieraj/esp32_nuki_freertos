@@ -1,4 +1,5 @@
 #include "nuki_uart_bridge.h"
+#include "esphome/core/application.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
@@ -219,6 +220,35 @@ void NukiUartBridgeLock::setup() {
     }
   }
 
+  // PIN: a persisted runtime override wins over the YAML value.
+  this->pin_ = this->pin_config_;
+  this->load_pin_record_();
+  if (this->pin_ == 0) {
+    this->pin_state_ = PinState::NOT_SET;
+  } else if (this->pin_state_ == PinState::NOT_SET) {
+    this->pin_state_ = PinState::SET; // YAML PIN, not verified yet
+  }
+  this->publish_pin_status_();
+  if (this->paired_sensor_ != nullptr) {
+    this->paired_sensor_->publish_state(false);
+  }
+  if (this->pairing_mode_switch_ != nullptr) {
+    this->pairing_mode_switch_->publish_state(false);
+  }
+
+#ifdef USE_TIME
+  if (this->time_ != nullptr) {
+    // Update Time once the clock is trusted, then daily (nuki_hub cadence
+    // is 12 h; the lock's own drift is small).
+    this->time_->add_on_time_sync_callback([this]() {
+      this->set_timeout("nuki_time_sync", TIME_SYNC_DELAY_MS,
+                        [this]() { this->time_update_due_ = true; });
+    });
+    this->set_interval("nuki_time_daily", TIME_UPDATE_INTERVAL_MS,
+                       [this]() { this->time_update_due_ = true; });
+  }
+#endif
+
   this->send_hello_();
 
 #ifdef USE_API
@@ -235,8 +265,17 @@ void NukiUartBridgeLock::setup() {
   this->register_service(&NukiUartBridgeLock::request_event_logs,
                          "request_event_logs", {"count"});
   this->register_service(&NukiUartBridgeLock::pair_host, "pair_host");
+  this->register_service(&NukiUartBridgeLock::lock_n_go, "lock_n_go",
+                         {"unlatch"});
+  this->register_service(&NukiUartBridgeLock::full_lock, "full_lock");
+  this->register_service(&NukiUartBridgeLock::fob_action, "fob_action", {"n"});
+  this->register_service(&NukiUartBridgeLock::update_time, "update_time");
+  this->register_service(&NukiUartBridgeLock::verify_pin, "verify_pin");
+  this->register_service(&NukiUartBridgeLock::set_runtime_action_suffix,
+                         "set_action_suffix", {"name"});
 #else
-  ESP_LOGW(TAG, "Keypad/event-log services need 'api: custom_services: true'");
+  ESP_LOGW(TAG, "Keypad/event-log/action services need 'api: "
+                "custom_services: true'");
 #endif
 #ifndef USE_API_HOMEASSISTANT_SERVICES
   if (this->send_events_) {
@@ -250,8 +289,20 @@ void NukiUartBridgeLock::setup() {
 void NukiUartBridgeLock::dump_config() {
   ESP_LOGCONFIG(TAG, "Nuki UART bridge:");
   LOG_LOCK("  ", "Lock", this);
-  ESP_LOGCONFIG(TAG, "  PIN: %s", this->pin_ != 0 ? "set" : "none");
+  ESP_LOGCONFIG(TAG, "  PIN: %s (%s, state %s)",
+                this->pin_ != 0 ? "set" : "none",
+                this->pin_override_ != 0 ? "runtime override" : "yaml",
+                pin_state_name(this->pin_state_));
   ESP_LOGCONFIG(TAG, "  Device type: %s", device_type_name(this->device_type_));
+  ESP_LOGCONFIG(TAG, "  Pairing mode timeout: %" PRIu32 " s",
+                this->pairing_mode_timeout_s_);
+  ESP_LOGCONFIG(TAG, "  Allowed actions: 0x%03X", this->allowed_actions_);
+  ESP_LOGCONFIG(TAG, "  Action name suffix: '%s'%s", this->action_suffix_,
+                this->action_suffix_[0] == '\0' ? " (= friendly name)" : "");
+#ifdef USE_TIME
+  ESP_LOGCONFIG(TAG, "  Update Time: %s",
+                this->time_ != nullptr ? "daily + after time sync" : "off");
+#endif
   ESP_LOGCONFIG(TAG, "  Pair as: %s",
                 this->id_type_ == NUKI_UART_ID_TYPE_BRIDGE ? "bridge" : "app");
   ESP_LOGCONFIG(TAG, "  App ID: %" PRIu32 " (0 = bridge default)",
@@ -287,15 +338,36 @@ void NukiUartBridgeLock::dump_config() {
     }
   }
   LOG_BINARY_SENSOR("  ", "Connected", this->connected_sensor_);
+  LOG_BINARY_SENSOR("  ", "Paired", this->paired_sensor_);
   LOG_SENSOR("  ", "RSSI", this->rssi_sensor_);
+  LOG_SENSOR("  ", "Battery level", this->battery_level_sensor_);
+  LOG_BINARY_SENSOR("  ", "Battery critical", this->battery_critical_sensor_);
+  LOG_BINARY_SENSOR("  ", "Battery charging", this->battery_charging_sensor_);
+  LOG_BINARY_SENSOR("  ", "Keypad battery critical",
+                    this->keypad_battery_critical_sensor_);
+  LOG_BINARY_SENSOR("  ", "Door sensor battery critical",
+                    this->door_sensor_battery_critical_sensor_);
+  LOG_BINARY_SENSOR("  ", "Night mode", this->night_mode_sensor_);
+  LOG_BINARY_SENSOR("  ", "Keypad paired", this->keypad_paired_sensor_);
   LOG_TEXT_SENSOR("  ", "Diagnostics", this->diagnostics_sensor_);
+  LOG_TEXT_SENSOR("  ", "PIN status", this->pin_status_sensor_);
+  LOG_TEXT_SENSOR("  ", "Nuki state", this->nuki_state_sensor_);
   LOG_TEXT_SENSOR("  ", "Last unlock user", this->last_unlock_user_sensor_);
   LOG_TEXT_SENSOR("  ", "Last lock action", this->last_lock_action_sensor_);
   LOG_TEXT_SENSOR("  ", "Last lock action trigger",
                   this->last_lock_action_trigger_sensor_);
+  LOG_TEXT_SENSOR("  ", "Last lock action completion status",
+                  this->completion_status_sensor_);
   LOG_TEXT_SENSOR("  ", "Door sensor state", this->door_sensor_state_sensor_);
+  LOG_TEXT_SENSOR("  ", "Door security state",
+                  this->door_security_state_sensor_);
+  LOG_TEXT_SENSOR("  ", "Firmware version", this->firmware_version_sensor_);
+  LOG_TEXT_SENSOR("  ", "Hardware version", this->hardware_version_sensor_);
+  LOG_TEXT_SENSOR("  ", "Lock name", this->lock_name_sensor_);
+  LOG_TEXT_SENSOR("  ", "Nuki ID", this->nuki_id_sensor_);
   LOG_BINARY_SENSOR("  ", "Door sensor", this->door_sensor_);
   LOG_BINARY_SENSOR("  ", "Tamper", this->tamper_sensor_);
+  LOG_SWITCH("  ", "Pairing mode", this->pairing_mode_switch_);
 }
 
 // ── Main loop (Core 1) — bounded, never blocks ────────────────────────
@@ -357,6 +429,41 @@ void NukiUartBridgeLock::loop() {
     this->end_stream_("idle timeout");
   }
 
+  // Transition watchdog (S4 F7): the lock said ACCEPTED but no settled
+  // Keyturner States followed — the 0x85 push can be lost on a reconnect,
+  // so read the state instead of sitting in LOCKING/UNLOCKING for 20 s.
+  if (this->action_seq_ != 0 && this->action_accepted_ms_ != 0 &&
+      this->connected_ &&
+      now - this->action_watchdog_ms_ >= TRANSITION_WATCHDOG_MS) {
+    this->action_watchdog_ms_ = now;
+    ESP_LOGW(TAG,
+             "Action 0x%02X accepted %" PRIu32
+             " ms ago without a settled state — requesting it",
+             this->action_cmd_, now - this->action_accepted_ms_);
+    this->request_lock_state();
+  }
+  if (this->retry_cmd_ != 0 && (int32_t)(now - this->retry_deadline_ms_) > 0) {
+    ESP_LOGW(TAG, "Action 0x%02X retry window expired", this->retry_cmd_);
+    this->clear_action_retry_();
+  }
+
+#ifdef USE_API
+  // Replay guard (nuki_hub, S3 F8): a Home Assistant (re)connect may flush
+  // stale service calls — ignore actions for the first 6 s.
+  {
+    const bool api_up = api::global_api_server != nullptr &&
+                        api::global_api_server->is_connected();
+    if (api_up && !this->api_was_connected_) {
+      this->actions_ignored_until_ms_ = now + ACTION_IGNORE_WINDOW_MS;
+      ESP_LOGD(TAG, "API client connected: actions ignored for %" PRIu32 " ms",
+               ACTION_IGNORE_WINDOW_MS);
+    }
+    this->api_was_connected_ = api_up;
+  }
+#endif
+
+  this->maybe_verify_pin_();
+  this->maybe_update_time_();
   this->expire_pending_(now);
 }
 
@@ -382,7 +489,77 @@ void NukiUartBridgeLock::open_latch() {
   this->send_action_(NUKI_UART_CMD_UNLATCH, lock::LOCK_STATE_UNLOCKING);
 }
 
-bool NukiUartBridgeLock::send_action_(uint8_t cmd, lock::LockState optimistic) {
+static uint16_t action_bit_for(uint8_t cmd) {
+  switch (cmd) {
+  case NUKI_UART_CMD_UNLOCK:
+    return ACTION_BIT_UNLOCK;
+  case NUKI_UART_CMD_LOCK:
+    return ACTION_BIT_LOCK;
+  case NUKI_UART_CMD_UNLATCH:
+    return ACTION_BIT_UNLATCH;
+  case NUKI_UART_CMD_LOCK_N_GO:
+    return ACTION_BIT_LOCK_N_GO;
+  case NUKI_UART_CMD_LOCK_N_GO_UNLATCH:
+    return ACTION_BIT_LOCK_N_GO_UNLATCH;
+  case NUKI_UART_CMD_FULL_LOCK:
+    return ACTION_BIT_FULL_LOCK;
+  case NUKI_UART_CMD_FOB_1:
+    return ACTION_BIT_FOB_1;
+  case NUKI_UART_CMD_FOB_2:
+    return ACTION_BIT_FOB_2;
+  case NUKI_UART_CMD_FOB_3:
+    return ACTION_BIT_FOB_3;
+  default:
+    return 0;
+  }
+}
+
+static lock::LockState optimistic_for(uint8_t cmd) {
+  switch (cmd) {
+  case NUKI_UART_CMD_LOCK:
+  case NUKI_UART_CMD_FULL_LOCK:
+    return lock::LOCK_STATE_LOCKING;
+  case NUKI_UART_CMD_UNLOCK:
+  case NUKI_UART_CMD_UNLATCH:
+  case NUKI_UART_CMD_LOCK_N_GO:
+  case NUKI_UART_CMD_LOCK_N_GO_UNLATCH:
+    return lock::LOCK_STATE_UNLOCKING;
+  default:
+    return lock::LOCK_STATE_NONE; // fob actions: unknown outcome
+  }
+}
+
+bool NukiUartBridgeLock::action_allowed_(uint8_t cmd) {
+  const uint16_t bit = action_bit_for(cmd);
+  if (bit == 0) {
+    ESP_LOGE(TAG, "0x%02X is not a lock action", cmd);
+    return false;
+  }
+  if ((this->allowed_actions_ & bit) == 0) {
+    ESP_LOGW(TAG, "Action 0x%02X refused: not in allowed_actions", cmd);
+    return false;
+  }
+  const uint32_t now = millis();
+  if ((int32_t)(this->actions_ignored_until_ms_ - now) > 0) {
+    ESP_LOGW(TAG,
+             "Action 0x%02X ignored: %" PRIu32
+             " ms into the post-connect guard window",
+             cmd,
+             now - (this->actions_ignored_until_ms_ - ACTION_IGNORE_WINDOW_MS));
+    return false;
+  }
+  return true;
+}
+
+bool NukiUartBridgeLock::send_action_(uint8_t cmd, lock::LockState optimistic,
+                                      const char *suffix, bool is_retry) {
+  if (!is_retry) {
+    this->clear_action_retry_(); // a newer action supersedes
+    if (!this->action_allowed_(cmd)) {
+      this->publish_state(this->state); // undo HA's optimistic flip
+      return false;
+    }
+  }
   if (this->link_ != LinkState::READY) {
     ESP_LOGW(TAG, "Action 0x%02X dropped: bridge link not ready", cmd);
     return false;
@@ -390,20 +567,153 @@ bool NukiUartBridgeLock::send_action_(uint8_t cmd, lock::LockState optimistic) {
   if (!this->paired_) {
     ESP_LOGW(TAG, "Action 0x%02X sent while bridge reports unpaired", cmd);
   }
+  // Optional per-action name suffix (spec p.36); no payload = the bridge
+  // uses the fixed one from SET_ACTION_SUFFIX (and its armed frames).
+  uint8_t payload[NUKI_ACTION_SUFFIX_LEN];
+  const size_t n = nuki_uart_build_action_suffix(payload, suffix);
   uint16_t seq = 0;
-  if (!this->send_cmd_(cmd, nullptr, 0, &seq)) {
+  if (!this->send_cmd_(cmd, n ? payload : nullptr, n, &seq)) {
     return false;
   }
   this->action_seq_ = seq;
   this->action_cmd_ = cmd;
   this->action_sent_ms_ = millis();
   this->action_accepted_ms_ = 0;
-  this->publish_state(optimistic);
-  ESP_LOGI(TAG, "-> action 0x%02X seq=%u", cmd, seq);
+  this->action_watchdog_ms_ = 0;
+  if (n > 0) {
+    strncpy(this->retry_suffix_, suffix, NUKI_ACTION_SUFFIX_LEN);
+    this->retry_suffix_[NUKI_ACTION_SUFFIX_LEN] = '\0';
+  } else {
+    this->retry_suffix_[0] = '\0';
+  }
+  this->retry_optimistic_ = optimistic;
+  if (optimistic != lock::LOCK_STATE_NONE) {
+    this->publish_state(optimistic);
+  }
+  ESP_LOGI(TAG, "-> action 0x%02X seq=%u%s%s", cmd, seq, n ? " suffix=" : "",
+           n ? suffix : "");
   return true;
 }
 
+bool NukiUartBridgeLock::lock_action(uint8_t cmd, const char *suffix) {
+  return this->send_action_(cmd, optimistic_for(cmd), suffix);
+}
+
+void NukiUartBridgeLock::lock_n_go(bool unlatch) {
+  // Home Assistant `nuki.lock_n_go` semantics: unlatch=true is lock 'n' go
+  // with unlatch (Lock Action 0x05), else plain lock 'n' go (0x04).
+  this->lock_action(unlatch ? NUKI_UART_CMD_LOCK_N_GO_UNLATCH
+                            : NUKI_UART_CMD_LOCK_N_GO);
+}
+
+void NukiUartBridgeLock::full_lock() {
+  this->lock_action(NUKI_UART_CMD_FULL_LOCK);
+}
+
+void NukiUartBridgeLock::fob_action(int32_t n) {
+  if (n < 1 || n > 3) {
+    ESP_LOGE(TAG, "fob_action: n must be 1..3 (got %" PRId32 ")", n);
+    return;
+  }
+  this->lock_action((uint8_t)(NUKI_UART_CMD_FOB_1 + (n - 1)));
+}
+
+// A failed action that never reached the lock (no ACCEPTED seen) is
+// re-sent once after the next CONNECTED inside a 10 s window (S4 F8).
+// Anything the lock may already have acted on is never re-sent (S1 A12).
+void NukiUartBridgeLock::arm_action_retry_(const char *why) {
+  if (this->action_accepted_ms_ != 0 || this->action_cmd_ == 0) {
+    return;
+  }
+  this->retry_cmd_ = this->action_cmd_;
+  this->retry_deadline_ms_ = millis() + ACTION_RETRY_WINDOW_MS;
+  ESP_LOGW(TAG, "Action 0x%02X will be retried once after reconnect (%s)",
+           this->retry_cmd_, why);
+}
+
+void NukiUartBridgeLock::clear_action_retry_() { this->retry_cmd_ = 0; }
+
+void NukiUartBridgeLock::maybe_retry_action_() {
+  if (this->retry_cmd_ == 0 || !this->connected_) {
+    return;
+  }
+  const uint8_t cmd = this->retry_cmd_;
+  this->retry_cmd_ = 0;
+  ESP_LOGI(TAG, "Retrying action 0x%02X after reconnect", cmd);
+  this->send_action_(cmd, this->retry_optimistic_,
+                     this->retry_suffix_[0] ? this->retry_suffix_ : nullptr,
+                     true);
+}
+
+void NukiUartBridgeLock::send_action_suffix_() {
+  if (this->suffix_unsupported_) {
+    return;
+  }
+  uint8_t payload[NUKI_ACTION_SUFFIX_LEN];
+  const char *name = this->action_suffix_;
+  if (name[0] == '\0') {
+    name = App.get_friendly_name().c_str();
+  }
+  const size_t n = nuki_uart_build_action_suffix(payload, name);
+  uint16_t seq = 0;
+  if (this->send_cmd_(NUKI_UART_CMD_SET_ACTION_SUFFIX, n ? payload : nullptr, n,
+                      &seq)) {
+    this->suffix_seq_ = seq;
+    ESP_LOGD(TAG, "-> SET_ACTION_SUFFIX '%.*s' seq=%u", (int)n, name, seq);
+  }
+}
+
+void NukiUartBridgeLock::set_runtime_action_suffix(std::string suffix) {
+  if (suffix.size() > NUKI_ACTION_SUFFIX_LEN) {
+    ESP_LOGW(TAG, "action suffix '%s' truncated to %u bytes", suffix.c_str(),
+             (unsigned)NUKI_ACTION_SUFFIX_LEN);
+  }
+  strncpy(this->action_suffix_buf_, suffix.c_str(), NUKI_ACTION_SUFFIX_LEN);
+  this->action_suffix_buf_[NUKI_ACTION_SUFFIX_LEN] = '\0';
+  this->action_suffix_ = this->action_suffix_buf_;
+  this->send_action_suffix_();
+}
+
 // ── Operator actions ──────────────────────────────────────────────────
+
+void NukiUartBridgeLock::set_pairing_mode(bool enabled) {
+  if (enabled == this->pairing_mode_) {
+    if (enabled) {
+      this->pair(); // manual re-trigger while already on
+    }
+    return;
+  }
+  this->pairing_mode_ = enabled;
+  if (this->pairing_mode_switch_ != nullptr) {
+    this->pairing_mode_switch_->publish_state(enabled);
+  }
+  this->cancel_timeout("nuki_pairing_mode");
+  this->cancel_timeout("nuki_pair_retry");
+  if (enabled) {
+    ESP_LOGI(TAG,
+             "Pairing mode on for %" PRIu32 " s — put the lock in pairing "
+             "mode (button ~5 s)",
+             this->pairing_mode_timeout_s_);
+    if (this->paired_) {
+      ESP_LOGW(TAG, "Bridge is already paired; pairing a different lock needs "
+                    "UNPAIR first");
+    }
+    if (this->pin_ == 0) {
+      ESP_LOGW(TAG, "No security_pin: pairing an Ultra will fail with "
+                    "PIN_REQUIRED");
+    }
+    this->pairing_mode_on_callback_.call();
+    this->set_timeout("nuki_pairing_mode",
+                      this->pairing_mode_timeout_s_ * 1000UL, [this]() {
+                        ESP_LOGW(TAG, "Pairing mode timed out");
+                        this->set_pairing_mode(false);
+                      });
+    this->pair();
+  } else {
+    ESP_LOGI(TAG, "Pairing mode off");
+    this->pairing_mode_off_callback_.call();
+  }
+}
 
 void NukiUartBridgeLock::pair() {
   if (this->link_ != LinkState::READY) {
@@ -481,6 +791,257 @@ void NukiUartBridgeLock::set_runtime_state_poll(uint16_t seconds) {
   this->send_cmd_(NUKI_UART_CMD_SET_STATE_POLL, payload, n);
 }
 
+// Request Config 0x0014 (nK only, no PIN): firmware / hardware version,
+// name, Nuki-ID, keypad and generation.  Sent after every connect and
+// whenever config_update_count changes (S1 A9).
+void NukiUartBridgeLock::request_config() {
+  if (this->link_ != LinkState::READY || !this->paired_ || !this->connected_) {
+    ESP_LOGD(TAG, "REQ_CONFIG skipped (link/paired/connected)");
+    return;
+  }
+  uint16_t seq = 0;
+  if (this->send_cmd_(NUKI_UART_CMD_REQ_CONFIG, nullptr, 0, &seq)) {
+    this->config_seq_ = seq;
+    ESP_LOGD(TAG, "-> REQ_CONFIG seq=%u", seq);
+  }
+}
+
+// ── PIN lifecycle ─────────────────────────────────────────────────────
+//
+// States follow the BLE component: NOT_SET (no PIN anywhere), SET (known,
+// not yet checked against the lock), VALID (Verify Security PIN 0x0020
+// answered Status COMPLETE), INVALID (K_ERROR_BAD_PIN / TOO_MANY_PIN_
+// ATTEMPTS from any PIN command).  INVALID blocks every PIN command until
+// set_security_pin() / verify_pin() succeed, so a wrong PIN cannot keep
+// hammering the lock (spec p.76: the lock locks out after 3 attempts).
+
+static const uint32_t PIN_PREF_MAGIC = 0x4E50494EUL; // "NPIN"
+static const uint32_t PIN_PREF_SALT = 0x7A1C3E55UL;
+
+const char *NukiUartBridgeLock::pin_state_name(PinState st) {
+  switch (st) {
+  case PinState::NOT_SET:
+    return "Not set";
+  case PinState::SET:
+    return "Validation pending";
+  case PinState::VALID:
+    return "Valid";
+  case PinState::INVALID:
+    return "Invalid";
+  default:
+    return "?";
+  }
+}
+
+void NukiUartBridgeLock::load_pin_record_() {
+  PinRecord rec{};
+  auto pref = global_preferences->make_preference<PinRecord>(
+      this->get_object_id_hash() ^ PIN_PREF_SALT, true);
+  if (!pref.load(&rec) || rec.magic != PIN_PREF_MAGIC) {
+    return;
+  }
+  if (rec.pin != 0 && rec.pin <= 999999) {
+    this->pin_override_ = rec.pin;
+    this->pin_ = rec.pin;
+  }
+  if (rec.state <= (uint8_t)PinState::INVALID) {
+    this->pin_state_ = (PinState)rec.state;
+  }
+  ESP_LOGD(TAG, "PIN record loaded (override %s, state %s)",
+           this->pin_override_ ? "set" : "none",
+           pin_state_name(this->pin_state_));
+}
+
+void NukiUartBridgeLock::save_pin_record_() {
+  PinRecord rec{};
+  rec.magic = PIN_PREF_MAGIC;
+  rec.pin = this->pin_override_;
+  rec.state = (uint8_t)this->pin_state_;
+  auto pref = global_preferences->make_preference<PinRecord>(
+      this->get_object_id_hash() ^ PIN_PREF_SALT, true);
+  if (!pref.save(&rec) || !global_preferences->sync()) {
+    ESP_LOGW(TAG, "PIN record not persisted");
+  }
+}
+
+void NukiUartBridgeLock::set_pin_state_(PinState st, bool persist) {
+  if (st == this->pin_state_) {
+    return;
+  }
+  ESP_LOGI(TAG, "PIN state: %s -> %s", pin_state_name(this->pin_state_),
+           pin_state_name(st));
+  this->pin_state_ = st;
+  if (persist) {
+    this->save_pin_record_();
+  }
+  this->publish_pin_status_();
+}
+
+void NukiUartBridgeLock::publish_pin_status_() {
+  if (this->pin_status_sensor_ != nullptr) {
+    this->pin_status_sensor_->publish_state(pin_state_name(this->pin_state_));
+  }
+}
+
+void NukiUartBridgeLock::set_security_pin(uint32_t pin) {
+  if (pin > 999999) {
+    ESP_LOGE(TAG, "set_security_pin: at most 6 digits (999999)");
+    return;
+  }
+  // The PIN itself is never logged.
+  this->pin_override_ = pin;
+  this->pin_ = pin != 0 ? pin : this->pin_config_;
+  ESP_LOGI(TAG, "Security PIN %s",
+           pin != 0                 ? "override set (persisted)"
+           : this->pin_config_ != 0 ? "override cleared, back to YAML"
+                                    : "cleared");
+  this->pin_state_ = PinState::NOT_SET; // force a state change below
+  this->set_pin_state_(this->pin_ != 0 ? PinState::SET : PinState::NOT_SET,
+                       true);
+  if (this->pin_ != 0) {
+    this->verify_after_connect_ = true;
+    this->maybe_verify_pin_();
+  }
+}
+
+// PIN-only payload commands share one shape: [PIN] with the width of the
+// paired device; the bridge splices nK in front (host-integration §7).
+bool NukiUartBridgeLock::send_pin_only_cmd_(uint8_t cmd, uint16_t *seq_out) {
+  uint8_t payload[4];
+  const size_t n =
+      nuki_uart_build_pin_only(payload, this->pin_, this->pin_device_type_());
+  return this->send_payload_cmd_(cmd, payload, n, seq_out);
+}
+
+void NukiUartBridgeLock::verify_pin() {
+  if (!this->pin_ready_("verify_pin", true)) {
+    return;
+  }
+  if (this->verify_unsupported_) {
+    ESP_LOGW(TAG, "verify_pin: this bridge firmware has no VERIFY_PIN (0x14)");
+    return;
+  }
+  if (this->verify_seq_ != 0 && this->find_pending_(this->verify_seq_)) {
+    ESP_LOGD(TAG, "verify_pin: already in flight");
+    return;
+  }
+  uint16_t seq = 0;
+  if (this->send_pin_only_cmd_(NUKI_UART_CMD_VERIFY_PIN, &seq)) {
+    this->verify_seq_ = seq;
+    this->verify_after_connect_ = false;
+    ESP_LOGI(TAG, "-> VERIFY_PIN seq=%u", seq);
+  }
+}
+
+// Verify once after boot and after every pairing, as soon as the bridge is
+// connected and the device type (PIN width) is known.
+void NukiUartBridgeLock::maybe_verify_pin_() {
+  if (!this->verify_after_connect_ || this->pin_ == 0 || !this->connected_ ||
+      !this->paired_ || this->stream_cmd_ != 0 || this->verify_unsupported_ ||
+      this->pin_device_type_() == NUKI_UART_DEVICE_AUTO) {
+    return;
+  }
+  if (this->pin_state_ == PinState::VALID) {
+    this->verify_after_connect_ = false; // persisted result, trust it
+    return;
+  }
+  this->verify_pin();
+}
+
+void NukiUartBridgeLock::on_bad_pin_(uint8_t err, const char *what) {
+  if (err == NUKI_K_ERROR_BAD_PIN) {
+    ESP_LOGE(TAG,
+             "K_ERROR_BAD_PIN for %s: security_pin is wrong — PIN "
+             "commands blocked until set_security_pin()/verify_pin()",
+             what);
+  } else {
+    ESP_LOGE(TAG,
+             "K_ERROR_TOO_MANY_PIN_ATTEMPTS for %s: the lock locked the "
+             "PIN out; wait before verify_pin()",
+             what);
+  }
+  this->set_pin_state_(PinState::INVALID, true);
+}
+
+// ── Update Time 0x0021 ────────────────────────────────────────────────
+
+void NukiUartBridgeLock::update_time() {
+#ifdef USE_TIME
+  if (this->time_ == nullptr) {
+    ESP_LOGW(TAG, "update_time: no time_id configured");
+    return;
+  }
+  if (!this->pin_ready_("update_time")) {
+    return;
+  }
+  // Taken as late as possible (pyNukiBT): the lock keeps local time and
+  // reports the timezone offset separately, so the wall clock goes out.
+  ESPTime t = this->time_->now();
+  if (!t.is_valid() || t.year < TIME_UPDATE_MIN_YEAR) {
+    ESP_LOGW(TAG, "update_time: clock not valid yet (year %u)", t.year);
+    return;
+  }
+  nuki_ts_t ts;
+  ts.year = t.year;
+  ts.month = t.month;
+  ts.day = t.day_of_month;
+  ts.hour = t.hour;
+  ts.minute = t.minute;
+  ts.second = t.second;
+  uint8_t payload[NUKI_TS_LEN + 4];
+  const size_t n = nuki_uart_build_update_time(payload, &ts, this->pin_,
+                                               this->pin_device_type_());
+  uint16_t seq = 0;
+  if (this->send_payload_cmd_(NUKI_UART_CMD_UPDATE_TIME, payload, n, &seq)) {
+    this->time_seq_ = seq;
+    this->time_update_due_ = false;
+    ESP_LOGI(TAG, "-> UPDATE_TIME %04u-%02u-%02u %02u:%02u:%02u seq=%u",
+             ts.year, ts.month, ts.day, ts.hour, ts.minute, ts.second, seq);
+  }
+#else
+  ESP_LOGW(TAG, "update_time: build has no time component");
+#endif
+}
+
+void NukiUartBridgeLock::maybe_update_time_() {
+  if (!this->time_update_due_ || !this->connected_ || !this->paired_ ||
+      this->pin_ == 0 || this->pin_state_ == PinState::INVALID ||
+      this->stream_cmd_ != 0 || this->action_seq_ != 0) {
+    return;
+  }
+  if (this->pin_state_ == PinState::SET && !this->verify_unsupported_) {
+    return; // let the verification finish first
+  }
+  this->update_time();
+  this->time_update_due_ = false; // one attempt per trigger
+}
+
+// ── Request Calibration 0x001A / Request Reboot 0x001D ────────────────
+
+void NukiUartBridgeLock::request_calibration() {
+  if (!this->pin_ready_("request_calibration")) {
+    return;
+  }
+  uint16_t seq = 0;
+  if (this->send_pin_only_cmd_(NUKI_UART_CMD_REQ_CALIBRATION, &seq)) {
+    ESP_LOGW(TAG,
+             "-> REQ_CALIBRATION seq=%u (the lock runs its calibration "
+             "cycle; up to ~30 s)",
+             seq);
+  }
+}
+
+void NukiUartBridgeLock::request_reboot() {
+  if (!this->pin_ready_("request_reboot")) {
+    return;
+  }
+  uint16_t seq = 0;
+  if (this->send_pin_only_cmd_(NUKI_UART_CMD_REQ_REBOOT, &seq)) {
+    ESP_LOGW(TAG, "-> REQ_REBOOT seq=%u (lock reboots, expect a reconnect)",
+             seq);
+  }
+}
+
 // ── Payload commands: event log, keypad, authorizations ───────────────
 //
 // All of these are "fields minus nK, PIN last" (bridge docs §7).  The lock
@@ -490,15 +1051,24 @@ void NukiUartBridgeLock::set_runtime_state_poll(uint16_t seconds) {
 // SEQ or with SEQ 0 while a stream is open.
 
 uint8_t NukiUartBridgeLock::pin_device_type_() const {
-  // Width follows what the bridge learned about the lock (diagnostics);
-  // the configured device_type is the fallback before the first report.
+  // Width follows the generation: the Config "Device Type" (S1 A17) is
+  // authoritative once read, then what the bridge learned about the lock
+  // (diagnostics); the configured device_type is the fallback before the
+  // first report.
+  if (this->config_valid_) {
+    const uint8_t t = nuki_config_uart_device_type(&this->config_);
+    if (t != NUKI_UART_DEVICE_AUTO) {
+      return t;
+    }
+  }
   if (this->diag_.valid && this->diag_.device_type != NUKI_UART_DEVICE_AUTO) {
     return this->diag_.device_type;
   }
   return this->device_type_;
 }
 
-bool NukiUartBridgeLock::pin_ready_(const char *what) const {
+bool NukiUartBridgeLock::pin_ready_(const char *what,
+                                    bool allow_invalid) const {
   if (this->link_ != LinkState::READY) {
     ESP_LOGW(TAG, "%s: bridge link not ready", what);
     return false;
@@ -509,6 +1079,13 @@ bool NukiUartBridgeLock::pin_ready_(const char *what) const {
   }
   if (this->pin_ == 0) {
     ESP_LOGW(TAG, "%s: security_pin is not configured", what);
+    return false;
+  }
+  if (this->pin_state_ == PinState::INVALID && !allow_invalid) {
+    ESP_LOGW(TAG,
+             "%s: PIN is marked invalid (bad PIN / lockout) — fix it "
+             "with set_security_pin() or re-check with verify_pin()",
+             what);
     return false;
   }
   const uint8_t dt = this->pin_device_type_();
@@ -1287,6 +1864,9 @@ void NukiUartBridgeLock::dispatch_msg_(const nuki_uart_msg_t &msg) {
   case NUKI_UART_RSP_DIAGNOSTICS:
     this->handle_diagnostics_(msg);
     break;
+  case NUKI_UART_RSP_CONFIG:
+    this->handle_config_(msg);
+    break;
   case NUKI_UART_RSP_LOG_ENTRY:
     this->handle_log_entry_(msg);
     break;
@@ -1356,6 +1936,7 @@ void NukiUartBridgeLock::handle_ack_(const nuki_uart_msg_t &msg) {
     case NUKI_UART_CMD_SET_LINK_PROFILE:
     case NUKI_UART_CMD_SET_STATE_POLL:
     case NUKI_UART_CMD_PAIR_WINDOW:
+    case NUKI_UART_CMD_SET_ACTION_SUFFIX:
       this->clear_pending_(p);
       break;
     case NUKI_UART_CMD_UNPAIR_HOST:
@@ -1379,10 +1960,16 @@ void NukiUartBridgeLock::handle_ack_(const nuki_uart_msg_t &msg) {
       break;
     case NUKI_UART_CMD_UNPAIR:
       this->clear_pending_(p);
-      this->paired_ = false;
+      this->set_paired_(false);
       this->pairing_ = false;
       this->last_nuki_lock_state_ = NUKI_LOCK_STATE_UNDEFINED;
+      this->config_valid_ = false;
+      this->config_update_count_ = -1;
       this->publish_state(lock::LOCK_STATE_NONE);
+      if (this->pin_state_ == PinState::VALID ||
+          this->pin_state_ == PinState::INVALID) {
+        this->set_pin_state_(PinState::SET, true); // new lock, re-verify
+      }
       ESP_LOGW(TAG, "Bridge credentials cleared (UNPAIR acknowledged)");
       break;
     default:
@@ -1400,7 +1987,7 @@ void NukiUartBridgeLock::handle_error_(const nuki_uart_msg_t &msg) {
            uart_error_name(code), msg.seq, cmd);
 
   if (code == NUKI_UART_ERR_NOT_PAIRED) {
-    this->paired_ = false;
+    this->set_paired_(false);
   }
   if (code == NUKI_UART_ERR_SECURE_REQUIRED && this->sec_in_use_()) {
     // Session lost on the bridge side (reboot missed, 120 s idle).
@@ -1421,20 +2008,74 @@ void NukiUartBridgeLock::handle_error_(const nuki_uart_msg_t &msg) {
     this->hs_attempts_ = HS_MAX_ATTEMPTS; // stop retrying by itself
   }
   if (msg.seq != 0 && msg.seq == this->action_seq_) {
+    // Nothing reached the lock in these two cases: one retry after the
+    // next CONNECTED.  Everything else (TIMEOUT after ACCEPTED, LOCK_BUSY,
+    // lock errors) is final — never re-send a Lock Action (S1 A12).
+    if (code == NUKI_UART_ERR_NOT_CONNECTED ||
+        (code == NUKI_UART_ERR_TIMEOUT && this->action_accepted_ms_ == 0)) {
+      this->arm_action_retry_(uart_error_name(code));
+    }
     this->fail_action_(msg.seq, uart_error_name(code));
   }
   if (this->pairing_ && msg.seq == this->pair_seq_) {
     this->pairing_ = false;
     ESP_LOGE(TAG, "Pairing failed: %s", uart_error_name(code));
+    if (this->pairing_mode_ && code != NUKI_UART_ERR_PIN_REQUIRED) {
+      // The switch stays on: keep trying until PAIRING_COMPLETE or the
+      // pairing_mode_timeout (PAIRING_BUSY: the bridge's own 30 s attempt
+      // is still running, so wait it out).
+      this->set_timeout("nuki_pair_retry", PAIR_RETRY_MS, [this]() {
+        if (this->pairing_mode_ && !this->paired_) {
+          this->pair();
+        }
+      });
+    } else if (this->pairing_mode_) {
+      this->set_pairing_mode(false); // no PIN: retrying cannot help
+    }
   }
   if (this->stream_cmd_ != 0 && msg.seq == this->stream_seq_) {
     this->end_stream_(uart_error_name(code));
   }
-  if (cmd == NUKI_UART_CMD_SET_STATE_POLL &&
-      (code == NUKI_UART_ERR_UNKNOWN_CMD ||
-       code == NUKI_UART_ERR_UNSUPPORTED)) {
+  const bool unknown =
+      code == NUKI_UART_ERR_UNKNOWN_CMD || code == NUKI_UART_ERR_UNSUPPORTED;
+  if (cmd == NUKI_UART_CMD_SET_STATE_POLL && unknown) {
     ESP_LOGW(TAG, "Bridge firmware has no SET_STATE_POLL; door/state "
                   "freshness follows its built-in poll");
+  }
+  if (msg.seq != 0 && msg.seq == this->verify_seq_) {
+    this->verify_seq_ = 0;
+    if (unknown) {
+      this->verify_unsupported_ = true;
+      ESP_LOGW(TAG,
+               "Bridge firmware has no VERIFY_PIN (0x14): PIN state "
+               "stays '%s'",
+               pin_state_name(this->pin_state_));
+    } else if (code == NUKI_UART_ERR_LOCK_ERROR) {
+      // [50][lock error] when the bridge folds the Error Report in
+      const uint8_t lock_err = msg.len >= 2 ? msg.data[1] : 0;
+      if (lock_err == NUKI_K_ERROR_BAD_PIN ||
+          lock_err == NUKI_K_ERROR_TOO_MANY_PIN_ATTEMPTS || lock_err == 0) {
+        this->on_bad_pin_(lock_err ? lock_err : NUKI_K_ERROR_BAD_PIN,
+                          "verify_pin");
+      } else {
+        ESP_LOGW(TAG, "verify_pin: lock error 0x%02X %s (PIN state kept)",
+                 lock_err, nuki_error_name(lock_err));
+      }
+    } else {
+      ESP_LOGW(TAG, "verify_pin: %s — retried on the next connect",
+               uart_error_name(code));
+    }
+  }
+  if (msg.seq != 0 && msg.seq == this->suffix_seq_ && unknown) {
+    this->suffix_unsupported_ = true;
+    this->suffix_seq_ = 0;
+    ESP_LOGW(TAG, "Bridge firmware has no SET_ACTION_SUFFIX (0x15): the "
+                  "lock log shows no user name");
+  }
+  if (msg.seq != 0 && msg.seq == this->time_seq_) {
+    this->time_seq_ = 0;
+    ESP_LOGW(TAG, "update_time failed: %s%s", uart_error_name(code),
+             unknown ? " (bridge firmware has no UPDATE_TIME 0x13)" : "");
   }
   if (p != nullptr) {
     this->clear_pending_(p);
@@ -1446,7 +2087,7 @@ void NukiUartBridgeLock::handle_status_(const nuki_uart_msg_t &msg) {
 
   // 1-byte form: reply to UART_CMD_STATUS = paired flag
   if (msg.len == 1) {
-    this->paired_ = msg.data[0] != 0;
+    this->set_paired_(msg.data[0] != 0);
     ESP_LOGD(TAG, "<- STATUS paired=%s", YESNO(this->paired_));
     if (p != nullptr) {
       this->clear_pending_(p);
@@ -1462,6 +2103,7 @@ void NukiUartBridgeLock::handle_status_(const nuki_uart_msg_t &msg) {
       if (status == NUKI_STATUS_ACCEPTED) {
         if (msg.seq != 0 && msg.seq == this->action_seq_) {
           this->action_accepted_ms_ = now;
+          this->action_watchdog_ms_ = now;
           ESP_LOGI(TAG,
                    "<- Status ACCEPTED for action 0x%02X after %" PRIu32 " ms",
                    this->action_cmd_, now - this->action_sent_ms_);
@@ -1470,6 +2112,14 @@ void NukiUartBridgeLock::handle_status_(const nuki_uart_msg_t &msg) {
         }
       } else if (status == NUKI_STATUS_COMPLETE) {
         ESP_LOGD(TAG, "<- Status COMPLETE seq=%u", msg.seq);
+        if (msg.seq != 0 && msg.seq == this->verify_seq_) {
+          this->verify_seq_ = 0;
+          ESP_LOGI(TAG, "Security PIN verified by the lock");
+          this->set_pin_state_(PinState::VALID, true);
+        } else if (msg.seq != 0 && msg.seq == this->time_seq_) {
+          this->time_seq_ = 0;
+          ESP_LOGI(TAG, "Lock time updated");
+        }
       } else {
         ESP_LOGW(TAG, "<- Status 0x%02X seq=%u", status, msg.seq);
       }
@@ -1486,6 +2136,10 @@ void NukiUartBridgeLock::handle_status_(const nuki_uart_msg_t &msg) {
       if (p != nullptr) {
         this->clear_pending_(p);
       }
+      return;
+    }
+    if (cmd_id == NUKI_CMD_ID_CONFIG) {
+      this->handle_config_(msg); // forwarded raw (no active command)
       return;
     }
     const uint8_t *body = nullptr;
@@ -1614,28 +2268,48 @@ void NukiUartBridgeLock::handle_state_change_(const nuki_uart_msg_t &msg) {
 void NukiUartBridgeLock::apply_keyturner_states_(const uint8_t *body,
                                                  size_t len) {
   // Keyturner States, Nuki API v2.3.1 pp.30-35. Length-driven: only the
-  // first two bytes are guaranteed, everything else is optional.
-  const uint8_t nuki_state = body[0];
-  const uint8_t lock_state = body[1];
-  const uint8_t trigger = len > 2 ? body[2] : 0xFF;
-  const int battery_pct = len > 12 ? ((body[12] >> 2) & 0x3F) * 2 : -1;
-  const bool battery_critical = len > 12 && (body[12] & 0x01);
-  const int last_action = len > 15 ? body[15] : -1;
-  const int last_action_trigger = len > 16 ? body[16] : -1;
-  const int door_sensor = len > 18 ? body[18] : -1;
+  // first two bytes are guaranteed, everything else is optional (the 2016
+  // worked example on p.87 is 13 bytes).
+  nuki_keyturner_t k;
+  if (nuki_uart_parse_keyturner(body, len, &k) != NUKI_UART_OK) {
+    return;
+  }
+  const uint8_t nuki_state = k.nuki_state;
+  const uint8_t lock_state = k.lock_state;
 
   ESP_LOGD(TAG,
-           "Keyturner: nuki_state=0x%02X lock_state=0x%02X trigger=0x%02X "
-           "battery=%d%%%s door=%d (len=%u)",
-           nuki_state, lock_state, trigger, battery_pct,
-           battery_critical ? " CRITICAL" : "", door_sensor, (unsigned)len);
+           "Keyturner: nuki_state=%s(0x%02X) lock_state=0x%02X trigger=%s "
+           "battery=%d%%%s%s door=%d night=%d cfg#=%d (len=%u)",
+           nuki_nuki_state_name(nuki_state), nuki_state, lock_state,
+           k.trigger != 0xFF ? nuki_trigger_name(k.trigger) : "-",
+           k.has_battery ? k.battery_percent : -1,
+           k.battery_critical ? " CRITICAL" : "",
+           k.battery_charging ? " charging" : "",
+           k.has_door_sensor ? k.door_sensor : -1,
+           k.has_night_mode ? k.night_mode : -1,
+           k.has_config_update_count ? k.config_update_count : -1,
+           (unsigned)len);
+
+  // Nuki state (byte 0): the lock only answers actions in door mode.  In
+  // pairing / maintenance mode the entity is "unknown" (the closest thing
+  // to HA's unavailable), like the core `nuki` integration's ERROR_STATES.
+  if (nuki_state != this->nuki_state_) {
+    this->nuki_state_ = nuki_state;
+    ESP_LOGI(TAG, "Nuki state: %s (0x%02X)", nuki_nuki_state_name(nuki_state),
+             nuki_state);
+    if (this->nuki_state_sensor_ != nullptr) {
+      this->nuki_state_sensor_->publish_state(nuki_nuki_state_name(nuki_state));
+    }
+  }
+  const bool in_door_mode = nuki_state == NUKI_NUKI_STATE_DOOR_MODE;
 
   // An unlatch is reported as UNLATCHING 0x07 -> UNLATCHED 0x05 -> UNLOCKED
   // 0x03, one 0x85 each a few seconds apart; the mapping folds 0x07 into
   // UNLOCKING and 0x05 into UNLOCKED and Lock::publish_state() de-dups, so
   // the entity settles once.  `changed` tracks the raw byte (for the
   // on_state_change trigger), `entity_changed` the HA-visible state.
-  const lock::LockState new_state = nuki_to_esphome_state(lock_state);
+  const lock::LockState new_state =
+      in_door_mode ? nuki_to_esphome_state(lock_state) : lock::LOCK_STATE_NONE;
   const bool changed = lock_state != this->last_nuki_lock_state_;
   const bool entity_changed = new_state != this->state;
   this->last_nuki_lock_state_ = lock_state;
@@ -1654,6 +2328,7 @@ void NukiUartBridgeLock::apply_keyturner_states_(const uint8_t *body,
                    ? this->action_accepted_ms_ - this->action_sent_ms_
                    : 0);
       this->action_seq_ = 0;
+      this->clear_action_retry_();
     }
   }
 
@@ -1666,27 +2341,62 @@ void NukiUartBridgeLock::apply_keyturner_states_(const uint8_t *body,
     this->state_change_callback_.call(lock_state);
   }
 
-  // Last Lock Action / trigger (spec p.32, bytes 15-16)
-  if (last_action >= 0 && last_action != this->last_action_) {
-    this->last_action_ = (int16_t)last_action;
+  // Battery (byte 12) and accessory batteries (byte 20)
+  this->apply_battery_(k);
+
+  // Config update count (byte 13, S1 A9): the lock bumps it on every
+  // config change — re-read Config instead of polling it.
+  if (k.has_config_update_count) {
+    if (this->config_update_count_ >= 0 &&
+        k.config_update_count != this->config_update_count_) {
+      ESP_LOGI(TAG, "Config update count %d -> %u: re-reading Config",
+               this->config_update_count_, k.config_update_count);
+      this->config_valid_ = false;
+      this->request_config();
+    }
+    this->config_update_count_ = k.config_update_count;
+  }
+
+  // Last Lock Action / trigger / completion status (spec p.32, bytes 15-17)
+  if (k.has_last_action && k.last_action != this->last_action_) {
+    this->last_action_ = k.last_action;
     if (this->last_lock_action_sensor_ != nullptr) {
       this->last_lock_action_sensor_->publish_state(
-          nuki_lock_action_name((uint8_t)last_action));
+          nuki_lock_action_name(k.last_action));
     }
   }
-  if (last_action_trigger >= 0 &&
-      last_action_trigger != this->last_action_trigger_) {
-    this->last_action_trigger_ = (int16_t)last_action_trigger;
+  if (k.has_last_action &&
+      k.last_action_trigger != this->last_action_trigger_) {
+    this->last_action_trigger_ = k.last_action_trigger;
     if (this->last_lock_action_trigger_sensor_ != nullptr) {
       this->last_lock_action_trigger_sensor_->publish_state(
-          nuki_trigger_name((uint8_t)last_action_trigger));
+          nuki_trigger_name(k.last_action_trigger));
     }
   }
-  if (changed && trigger == NUKI_TRIGGER_MANUAL) {
+  if (k.has_last_action_completion &&
+      k.last_action_completion != this->last_action_completion_) {
+    this->last_action_completion_ = k.last_action_completion;
+    if (k.last_action_completion != NUKI_COMPLETION_SUCCESS) {
+      ESP_LOGW(TAG, "Last lock action completed with %s (0x%02X)",
+               nuki_completion_status_name(k.last_action_completion),
+               k.last_action_completion);
+    }
+    if (this->completion_status_sensor_ != nullptr) {
+      this->completion_status_sensor_->publish_state(
+          nuki_completion_status_name(k.last_action_completion));
+    }
+  }
+  if (changed && k.trigger == NUKI_TRIGGER_MANUAL) {
     this->publish_last_unlock_user_("Manual");
   }
-  if (door_sensor >= 0) {
-    this->apply_door_sensor_((uint8_t)door_sensor);
+  if (k.has_night_mode && this->night_mode_sensor_ != nullptr) {
+    this->night_mode_sensor_->publish_state(k.night_mode != 0);
+  }
+  if (k.has_door_sensor) {
+    this->apply_door_sensor_(k.door_sensor);
+  }
+  if (changed) {
+    this->publish_door_security_state_();
   }
 
   // A settled state after a change: the lock has a fresh log entry telling
@@ -1696,6 +2406,58 @@ void NukiUartBridgeLock::apply_keyturner_states_(const uint8_t *body,
                          new_state == lock::LOCK_STATE_JAMMED)) {
     this->schedule_log_poll_();
   }
+}
+
+void NukiUartBridgeLock::apply_battery_(const nuki_keyturner_t &k) {
+  if (!k.has_battery) {
+    return;
+  }
+  if (k.battery_percent != this->battery_percent_) {
+    this->battery_percent_ = k.battery_percent;
+    ESP_LOGI(TAG, "Battery %u%%%s%s", k.battery_percent,
+             k.battery_critical ? " (critical)" : "",
+             k.battery_charging ? " (charging)" : "");
+  }
+  if (this->battery_level_sensor_ != nullptr) {
+    this->battery_level_sensor_->publish_state(k.battery_percent);
+  }
+  if (this->battery_critical_sensor_ != nullptr) {
+    this->battery_critical_sensor_->publish_state(k.battery_critical != 0);
+  }
+  if (this->battery_charging_sensor_ != nullptr) {
+    this->battery_charging_sensor_->publish_state(k.battery_charging != 0);
+  }
+  // Accessory bits are only meaningful when the "supported" bit says the
+  // accessory is paired; otherwise the entity is unavailable (spec p.33).
+  if (this->keypad_battery_critical_sensor_ != nullptr) {
+    if (k.has_accessory_battery && k.keypad_present) {
+      this->keypad_battery_critical_sensor_->publish_state(
+          k.keypad_battery_critical != 0);
+    } else {
+      this->keypad_battery_critical_sensor_->invalidate_state();
+    }
+  }
+  if (this->door_sensor_battery_critical_sensor_ != nullptr) {
+    if (k.has_accessory_battery && k.door_sensor_battery_present) {
+      this->door_sensor_battery_critical_sensor_->publish_state(
+          k.door_sensor_battery_critical != 0);
+    } else {
+      this->door_sensor_battery_critical_sensor_->invalidate_state();
+    }
+  }
+}
+
+void NukiUartBridgeLock::publish_door_security_state_() {
+  if (this->door_security_state_sensor_ == nullptr || this->door_state_ < 0) {
+    return;
+  }
+  const uint8_t door = (uint8_t)this->door_state_;
+  // No real reading (unavailable / deactivated / uncalibrated / tampered):
+  // say so instead of guessing "open".
+  this->door_security_state_sensor_->publish_state(
+      door == NUKI_DOOR_CLOSED || door == NUKI_DOOR_OPENED
+          ? nuki_door_security_state_name(this->last_nuki_lock_state_, door)
+          : "unknown");
 }
 
 void NukiUartBridgeLock::apply_door_sensor_(uint8_t state) {
@@ -1727,9 +2489,90 @@ void NukiUartBridgeLock::apply_door_sensor_(uint8_t state) {
     }
   }
   this->door_state_callback_.call(state);
+  this->publish_door_security_state_();
   if (state == NUKI_DOOR_OPENED || state == NUKI_DOOR_CLOSED ||
       state == NUKI_DOOR_TAMPERED) {
     this->schedule_log_poll_(); // door log entries carry the exact time
+  }
+}
+
+// ── Config 0x0015 ─────────────────────────────────────────────────────
+
+void NukiUartBridgeLock::handle_config_(const nuki_uart_msg_t &msg) {
+  PendingRequest *p = this->find_pending_(msg.seq);
+  if (p != nullptr) {
+    this->clear_pending_(p);
+  }
+  if (msg.seq == this->config_seq_) {
+    this->config_seq_ = 0;
+  }
+  nuki_config_t c;
+  const int rc = nuki_uart_parse_config(msg.data, msg.len, &c);
+  if (rc != NUKI_UART_OK) {
+    ESP_LOGW(TAG, "<- CONFIG rejected (%d) len=%u", rc, (unsigned)msg.len);
+    return;
+  }
+  const bool first = !this->config_valid_;
+  this->config_ = c;
+  this->config_valid_ = true;
+  ESP_LOGI(
+      TAG,
+      "<- Config: '%s' id=%" PRIu32 " fw=%u.%u.%u hw=%u.%u type=%s "
+      "keypad=%s%s pairing=%u button=%u led=%u/%u auto_unlatch=%u "
+      "single_lock=%u adv=%u tz=%d%s matter=%s (len=%u)",
+      c.name, c.nuki_id, c.fw_version[0], c.fw_version[1], c.fw_version[2],
+      c.hw_revision[0], c.hw_revision[1],
+      c.has_device_type ? nuki_config_device_type_name(c.device_type) : "n/a",
+      nuki_config_keypad_paired(&c) ? "yes" : "no",
+      c.has_keypad2_flag && c.has_keypad2 ? " (2.0)" : "", c.pairing_enabled,
+      c.button_enabled, c.led_enabled, c.led_brightness, c.auto_unlatch,
+      c.single_lock, c.advertising_mode, c.tz_offset_min,
+      c.dst_mode ? " DST" : "",
+      c.has_matter_status ? nuki_matter_status_name(c.matter_status) : "n/a",
+      (unsigned)msg.len);
+  if (c.has_device_type) {
+    const uint8_t t = nuki_config_uart_device_type(&c);
+    if (this->diag_.valid && t != NUKI_UART_DEVICE_AUTO &&
+        this->diag_.device_type != NUKI_UART_DEVICE_AUTO &&
+        t != this->diag_.device_type) {
+      ESP_LOGW(TAG,
+               "Config says %s but the bridge paired as %s: PIN width "
+               "follows Config",
+               device_type_name(t), device_type_name(this->diag_.device_type));
+    }
+  }
+  this->publish_config_();
+  if (first) {
+    this->maybe_verify_pin_(); // PIN width may only be known now
+  }
+}
+
+void NukiUartBridgeLock::publish_config_() {
+  if (!this->config_valid_) {
+    return;
+  }
+  const nuki_config_t &c = this->config_;
+  char buf[48];
+  if (this->firmware_version_sensor_ != nullptr) {
+    snprintf(buf, sizeof(buf), "%u.%u.%u", c.fw_version[0], c.fw_version[1],
+             c.fw_version[2]);
+    this->firmware_version_sensor_->publish_state(buf);
+  }
+  if (this->hardware_version_sensor_ != nullptr) {
+    snprintf(buf, sizeof(buf), "%u.%u", c.hw_revision[0], c.hw_revision[1]);
+    this->hardware_version_sensor_->publish_state(buf);
+  }
+  if (this->lock_name_sensor_ != nullptr) {
+    this->lock_name_sensor_->publish_state(c.name);
+  }
+  if (this->nuki_id_sensor_ != nullptr) {
+    // Same presentation as the Nuki Bridge/Web API: hex, upper case.
+    snprintf(buf, sizeof(buf), "%08" PRIX32, c.nuki_id);
+    this->nuki_id_sensor_->publish_state(buf);
+  }
+  if (this->keypad_paired_sensor_ != nullptr) {
+    this->keypad_paired_sensor_->publish_state(nuki_config_keypad_paired(&c) !=
+                                               0);
   }
 }
 
@@ -1752,8 +2595,21 @@ void NukiUartBridgeLock::handle_error_report_(const nuki_uart_msg_t &msg) {
   if (this->stream_cmd_ != 0 && msg.seq == this->stream_seq_) {
     this->end_stream_(nuki_error_name(err));
   }
-  if (err == 0x21 && p != nullptr) {
-    ESP_LOGE(TAG, "K_ERROR_BAD_PIN for cmd 0x%02X: check security_pin", p->cmd);
+  if (msg.seq != 0 && msg.seq == this->verify_seq_) {
+    this->verify_seq_ = 0;
+    if (err != NUKI_K_ERROR_BAD_PIN &&
+        err != NUKI_K_ERROR_TOO_MANY_PIN_ATTEMPTS) {
+      ESP_LOGW(TAG, "verify_pin: %s (PIN state kept)", nuki_error_name(err));
+    }
+  }
+  if (msg.seq != 0 && msg.seq == this->time_seq_) {
+    this->time_seq_ = 0;
+  }
+  if (err == NUKI_K_ERROR_BAD_PIN ||
+      err == NUKI_K_ERROR_TOO_MANY_PIN_ATTEMPTS) {
+    char what[24];
+    snprintf(what, sizeof(what), "cmd 0x%02X", p ? p->cmd : 0);
+    this->on_bad_pin_(err, what);
   }
   if (p != nullptr) {
     this->clear_pending_(p);
@@ -1804,13 +2660,25 @@ void NukiUartBridgeLock::handle_conn_status_(const nuki_uart_msg_t &msg) {
 void NukiUartBridgeLock::handle_pairing_complete_(const nuki_uart_msg_t &msg) {
   const uint32_t auth_id = msg.len >= 4 ? nuki_uart_get_u32(msg.data) : 0;
   ESP_LOGI(TAG, "<- PAIRING_COMPLETE auth_id=%" PRIu32, auth_id);
-  this->paired_ = true;
+  this->set_paired_(true);
   this->pairing_ = false;
   this->auth_fetched_ = false; // new authorization list
+  this->config_valid_ = false;
+  this->config_update_count_ = -1;
   PendingRequest *p = this->find_pending_(msg.seq);
   if (p != nullptr) {
     this->clear_pending_(p);
   }
+  this->cancel_timeout("nuki_pair_retry");
+  if (this->pairing_mode_) {
+    this->set_pairing_mode(false);
+  }
+  // A fresh pairing: check the PIN against this lock once connected.
+  if (this->pin_ != 0) {
+    this->set_pin_state_(PinState::SET, true);
+    this->verify_after_connect_ = true;
+  }
+  this->time_update_due_ = true;
   this->pairing_complete_callback_.call(auth_id);
   // conn_mgr restarts by itself; the state read is answered once connected.
   this->request_lock_state();
@@ -1913,6 +2781,10 @@ void NukiUartBridgeLock::handle_diagnostics_(const nuki_uart_msg_t &msg) {
       dg.logtail_last_index = nuki_uart_get_u32(d + o);
       o += 4;
     }
+    if (n >= o + 1) {
+      dg.has_pin_flags = true; // §16: bit0 held, bit1 persisted, bit7 any
+      dg.pin_flags = d[o++];
+    }
   }
   if (o < n) {
     ESP_LOGD(TAG, "<- DIAGNOSTICS: %u trailing bytes not parsed",
@@ -1922,7 +2794,7 @@ void NukiUartBridgeLock::handle_diagnostics_(const nuki_uart_msg_t &msg) {
   this->diag_ = dg;
 
   // Keep the lock/pairing view in sync with the bridge.
-  this->paired_ = dg.creds_valid;
+  this->set_paired_(dg.creds_valid);
   this->conn_state_ = dg.conn_state;
   this->set_connected_(dg.conn_state == NUKI_UART_CONN_CONNECTED);
 
@@ -1978,6 +2850,7 @@ void NukiUartBridgeLock::handle_diagnostics_(const nuki_uart_msg_t &msg) {
   }
   this->publish_diagnostics_text_();
   this->maybe_request_auth_entries_();
+  this->maybe_verify_pin_();
 }
 
 void NukiUartBridgeLock::publish_diagnostics_text_() {
@@ -2049,10 +2922,13 @@ void NukiUartBridgeLock::on_link_ready_() {
 }
 
 void NukiUartBridgeLock::run_link_ready_actions_() {
+  this->actions_ignored_until_ms_ = millis() + ACTION_IGNORE_WINDOW_MS;
   this->set_runtime_link_profile(this->link_profile_);
   this->set_runtime_state_poll(this->state_poll_s_);
+  this->send_action_suffix_();
   this->request_diagnostics(); // learns creds_valid / device_type / arm state
   this->request_lock_state();
+  this->verify_after_connect_ = true;
 }
 
 void NukiUartBridgeLock::on_bridge_restart_() {
@@ -2067,6 +2943,10 @@ void NukiUartBridgeLock::on_bridge_restart_() {
   this->clear_all_pending_();
   this->pairing_ = false;
   this->action_seq_ = 0;
+  this->clear_action_retry_();
+  this->verify_seq_ = this->time_seq_ = this->config_seq_ = 0;
+  this->suffix_unsupported_ = false; // new firmware may have it
+  this->verify_unsupported_ = false;
   this->end_stream_("bridge restart");
   this->sec_end_session_("bridge restarted");
   this->host_pairing_ = false;
@@ -2088,6 +2968,8 @@ void NukiUartBridgeLock::on_link_lost_() {
   this->clear_all_pending_();
   this->pairing_ = false;
   this->action_seq_ = 0;
+  this->clear_action_retry_();
+  this->verify_seq_ = this->time_seq_ = this->config_seq_ = 0;
   this->end_stream_("link lost");
   this->sec_end_session_("link lost");
   this->host_pairing_ = false;
@@ -2107,10 +2989,26 @@ void NukiUartBridgeLock::set_connected_(bool connected) {
   }
   if (connected) {
     this->request_lock_state();
+    this->request_config();
+    this->maybe_retry_action_();
     this->maybe_request_auth_entries_();
+    if (this->pin_state_ == PinState::SET) {
+      this->verify_after_connect_ = true; // still unverified: try again
+    }
+    this->maybe_verify_pin_();
   } else {
     // The lock is unreachable: report unknown rather than a stale state.
     this->publish_state(lock::LOCK_STATE_NONE);
+  }
+}
+
+void NukiUartBridgeLock::set_paired_(bool paired) {
+  if (paired == this->paired_) {
+    return;
+  }
+  this->paired_ = paired;
+  if (this->paired_sensor_ != nullptr) {
+    this->paired_sensor_->publish_state(paired);
   }
 }
 

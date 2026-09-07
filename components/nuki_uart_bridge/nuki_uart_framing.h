@@ -54,8 +54,24 @@ extern "C" {
 #define NUKI_UART_CMD_PAIR 0x05
 #define NUKI_UART_CMD_LOCK_N_GO 0x06
 #define NUKI_UART_CMD_METRICS 0x07
+#define NUKI_UART_CMD_LOCK_N_GO_UNLATCH 0x08
+#define NUKI_UART_CMD_FULL_LOCK 0x09
+#define NUKI_UART_CMD_FOB_1 0x0A
+#define NUKI_UART_CMD_FOB_2 0x0B
+#define NUKI_UART_CMD_FOB_3 0x0C
 #define NUKI_UART_CMD_REQ_LOCK_STATE 0x10
 #define NUKI_UART_CMD_REQ_BATTERY 0x11
+/* Phase 4 passthroughs (docs/host-integration.md §7 on the bridge):
+ * UPDATE_TIME  [year:2 LE][month][day][hour][min][sec] + PIN  (0x0021)
+ * VERIFY_PIN   PIN only                                       (0x0020)
+ * SET_ACTION_SUFFIX [suffix: 0..20 bytes], ACK only; the bridge appends it
+ *   to every Lock Action it builds (spec p.36 "Name suffix"). */
+#define NUKI_UART_CMD_UPDATE_TIME 0x13
+#define NUKI_UART_CMD_VERIFY_PIN 0x14
+#define NUKI_UART_CMD_SET_ACTION_SUFFIX 0x15
+#define NUKI_UART_CMD_REQ_CONFIG 0x20
+#define NUKI_UART_CMD_REQ_CALIBRATION 0x70
+#define NUKI_UART_CMD_REQ_REBOOT 0x73
 #define NUKI_UART_CMD_UNPAIR 0x74
 #define NUKI_UART_CMD_SET_LINK_PROFILE 0x76
 #define NUKI_UART_CMD_PING 0x7C
@@ -69,6 +85,7 @@ extern "C" {
 #define NUKI_UART_RSP_PAIRING_COMPLETE 0x83
 #define NUKI_UART_RSP_METRICS 0x84
 #define NUKI_UART_RSP_STATE_CHANGE 0x85
+#define NUKI_UART_RSP_CONFIG 0x86
 #define NUKI_UART_RSP_BATTERY_REPORT 0x8B
 #define NUKI_UART_RSP_DIAGNOSTICS 0x8C
 #define NUKI_UART_RSP_CONN_STATUS 0x8D
@@ -116,6 +133,25 @@ extern "C" {
 #define NUKI_CMD_ID_KEYTURNER_STATES 0x000C
 #define NUKI_CMD_ID_STATUS 0x000E
 #define NUKI_CMD_ID_ERROR_REPORT 0x0012
+#define NUKI_CMD_ID_CONFIG 0x0015
+
+/* Nuki state = Keyturner States byte 0 (API v2.3.1 p.30) */
+#define NUKI_NUKI_STATE_UNINITIALIZED 0x00
+#define NUKI_NUKI_STATE_PAIRING_MODE 0x01
+#define NUKI_NUKI_STATE_DOOR_MODE 0x02
+#define NUKI_NUKI_STATE_MAINTENANCE_MODE 0x04
+
+/* Keyturner States battery byte (p.32) and accessory battery byte (p.33) */
+#define NUKI_BATTERY_CRITICAL_BIT 0x01
+#define NUKI_BATTERY_CHARGING_BIT 0x02
+#define NUKI_ACCESSORY_KEYPAD_SUPPORTED 0x01
+#define NUKI_ACCESSORY_KEYPAD_CRITICAL 0x02
+#define NUKI_ACCESSORY_DOOR_SENSOR_SUPPORTED 0x04
+#define NUKI_ACCESSORY_DOOR_SENSOR_CRITICAL 0x08
+
+/* Nuki lock error codes that concern the PIN (pp.76-77) */
+#define NUKI_K_ERROR_BAD_PIN 0x21
+#define NUKI_K_ERROR_TOO_MANY_PIN_ATTEMPTS 0x28
 
 /* Nuki lock states (API v2.3.1 p.31) */
 #define NUKI_LOCK_STATE_UNCALIBRATED 0x00
@@ -387,8 +423,9 @@ static inline void nuki_uart_put_u32(uint8_t *p, uint32_t v) {
  * Locate the Keyturner States body inside a STATE_CHANGE / STATUS payload.
  * The bridge forwards decrypted lock messages as [cmd_id:2 LE][payload]; a
  * bare payload (no cmd id) is also tolerated because a Nuki State byte can
- * never be 0x0C.  Returns the body length (>= 2) or 0 if not a Keyturner
- * States message.  *nuki_state / *lock_state receive bytes 0 and 1 (p.30).
+ * never be 0x0C, 0x0E, 0x12 or 0x15.  Returns the body length (>= 2) or 0
+ * if not a Keyturner States message.  *nuki_state / *lock_state receive bytes 0
+ * and 1 (p.30).
  */
 static inline size_t nuki_uart_keyturner_body(const uint8_t *data, size_t len,
                                               const uint8_t **body) {
@@ -400,7 +437,8 @@ static inline size_t nuki_uart_keyturner_body(const uint8_t *data, size_t len,
     return len - 2U;
   }
   if (nuki_uart_get_u16(data) == NUKI_CMD_ID_STATUS ||
-      nuki_uart_get_u16(data) == NUKI_CMD_ID_ERROR_REPORT) {
+      nuki_uart_get_u16(data) == NUKI_CMD_ID_ERROR_REPORT ||
+      nuki_uart_get_u16(data) == NUKI_CMD_ID_CONFIG) {
     return 0U;
   }
   *body = data;

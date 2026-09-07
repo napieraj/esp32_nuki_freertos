@@ -4,7 +4,9 @@
  * for the 0x87 / 0x88 / 0x89 entry streams.
  *
  * Nuki publishes no vectors for these commands; the frames below are built
- * by hand from the field tables of API v2.3.1 (pp.22-25, 49-53, 63-73).
+ * by hand from the field tables of API v2.3.1 (pp.22-25, 30-35, 42-48,
+ * 49-53, 63-73).  The Keyturner States vectors are the spec's own worked
+ * examples (p.87 step 2e, 13 bytes) and the bridge's host-integration §13.
  *
  * Build & run:  make test-host
  */
@@ -208,6 +210,332 @@ static void test_builders(void) {
   }
   /* Every builder stays inside the bridge's 96-byte payload limit. */
   CHECK(47 + 4 <= NUKI_UART_PAYLOAD_MAX);
+}
+
+/* ── Phase 4 passthroughs: Update Time / Verify PIN / action suffix ──── */
+
+static void test_phase4_builders(void) {
+  uint8_t out[NUKI_UART_PAYLOAD_MAX];
+  uint8_t wire[NUKI_UART_WIRE_MAX];
+  nuki_ts_t ts;
+  ts.year = 2026;
+  ts.month = 9;
+  ts.day = 7;
+  ts.hour = 12;
+  ts.minute = 34;
+  ts.second = 56;
+
+  /* UPDATE_TIME 0x13, Ultra PIN 065432: time(7) + PIN(4) = 11 bytes */
+  {
+    static const uint8_t exp[] = {0xEA, 0x07, 0x09, 0x07, 0x0C, 0x22,
+                                  0x38, 0x98, 0xFF, 0x00, 0x00};
+    size_t n =
+        nuki_uart_build_update_time(out, &ts, 65432, NUKI_UART_DEVICE_ULTRA);
+    CHECK(n == sizeof(exp));
+    CHECK(bytes_eq(out, exp, sizeof(exp)));
+    hexdump("UPDATE_TIME payload (Ultra)", out, n);
+    int w = nuki_uart_build_frame(wire, sizeof(wire), NUKI_UART_PROTO_V2,
+                                  NUKI_UART_CMD_UPDATE_TIME, 9, out, n);
+    CHECK(w > 0);
+    if (w > 0) {
+      hexdump("UPDATE_TIME wire (v2 seq 9)", wire, (size_t)w);
+      uint8_t frame[NUKI_UART_RX_FRAME_MAX];
+      nuki_uart_msg_t msg;
+      int d = nuki_uart_cobs_decode(frame, sizeof(frame), wire + 1,
+                                    (size_t)w - 2);
+      CHECK(d == (int)(3 + n + 2));
+      hexdump("UPDATE_TIME body (decoded)", frame, (size_t)d);
+      CHECK(nuki_uart_parse_frame(frame, (size_t)d, NUKI_UART_PROTO_V2,
+                                  &msg) == NUKI_UART_OK);
+      CHECK(msg.type == NUKI_UART_CMD_UPDATE_TIME && msg.seq == 9 &&
+            msg.len == n && bytes_eq(msg.data, exp, n));
+    }
+  }
+  /* gen 1-4 PIN 1234: 9 bytes, uint16 PIN */
+  {
+    static const uint8_t exp[] = {0xEA, 0x07, 0x09, 0x07, 0x0C,
+                                  0x22, 0x38, 0xD2, 0x04};
+    size_t n = nuki_uart_build_update_time(out, &ts, 1234,
+                                           NUKI_UART_DEVICE_CLASSIC);
+    CHECK(n == sizeof(exp) && bytes_eq(out, exp, sizeof(exp)));
+    hexdump("UPDATE_TIME payload (gen1-4)", out, n);
+  }
+  /* VERIFY_PIN 0x14: PIN only (host-integration §7 REQ_CALIBRATION shape) */
+  {
+    static const uint8_t exp_u[] = {0x98, 0xFF, 0x00, 0x00};
+    static const uint8_t exp_c[] = {0xD2, 0x04};
+    size_t n = nuki_uart_build_pin_only(out, 65432, NUKI_UART_DEVICE_ULTRA);
+    CHECK(n == 4 && bytes_eq(out, exp_u, 4));
+    int w = nuki_uart_build_frame(wire, sizeof(wire), NUKI_UART_PROTO_V2,
+                                  NUKI_UART_CMD_VERIFY_PIN, 10, out, n);
+    CHECK(w > 0);
+    if (w > 0) {
+      hexdump("VERIFY_PIN wire (Ultra, v2 seq 10)", wire, (size_t)w);
+    }
+    n = nuki_uart_build_pin_only(out, 1234, NUKI_UART_DEVICE_CLASSIC);
+    CHECK(n == 2 && bytes_eq(out, exp_c, 2));
+    w = nuki_uart_build_frame(wire, sizeof(wire), NUKI_UART_PROTO_V2,
+                              NUKI_UART_CMD_VERIFY_PIN, 10, out, n);
+    CHECK(w > 0);
+    if (w > 0) {
+      hexdump("VERIFY_PIN wire (gen1-4, v2 seq 10)", wire, (size_t)w);
+    }
+    /* REQ_CALIBRATION gen 1-4 PIN 1234 SEQ 5: body 70 05 00 D2 04 | 0E 83
+     * (host-integration.md §7 "PIN width by device type") */
+    w = nuki_uart_build_frame(wire, sizeof(wire), NUKI_UART_PROTO_V2,
+                              NUKI_UART_CMD_REQ_CALIBRATION, 5, out, n);
+    CHECK(w > 0);
+    if (w > 0) {
+      uint8_t frame[NUKI_UART_RX_FRAME_MAX];
+      static const uint8_t exp_body[] = {0x70, 0x05, 0x00, 0xD2,
+                                         0x04, 0x0E, 0x83};
+      int d = nuki_uart_cobs_decode(frame, sizeof(frame), wire + 1,
+                                    (size_t)w - 2);
+      CHECK(d == 7 && bytes_eq(frame, exp_body, 7));
+    }
+  }
+  /* SET_ACTION_SUFFIX 0x15: raw bytes, truncated at 20, empty = clear */
+  {
+    size_t n = nuki_uart_build_action_suffix(out, "Alice");
+    CHECK(n == 5 && memcmp(out, "Alice", 5) == 0);
+    n = nuki_uart_build_action_suffix(out, "abcdefghijklmnopqrstuvwxyz");
+    CHECK(n == NUKI_ACTION_SUFFIX_LEN && out[19] == 't');
+    CHECK(nuki_uart_build_action_suffix(out, "") == 0);
+    CHECK(nuki_uart_build_action_suffix(out, NULL) == 0);
+    n = nuki_uart_build_action_suffix(out, "Home Assistant");
+    int w = nuki_uart_build_frame(wire, sizeof(wire), NUKI_UART_PROTO_V2,
+                                  NUKI_UART_CMD_SET_ACTION_SUFFIX, 11, out, n);
+    CHECK(w > 0);
+    if (w > 0) {
+      hexdump("SET_ACTION_SUFFIX wire (v2 seq 11)", wire, (size_t)w);
+    }
+    /* UNLOCK with a per-action suffix: [01][seq]["Alice"] */
+    w = nuki_uart_build_frame(wire, sizeof(wire), NUKI_UART_PROTO_V2,
+                              NUKI_UART_CMD_UNLOCK, 12, (const uint8_t *)"Alice",
+                              5);
+    CHECK(w > 0);
+    if (w > 0) {
+      hexdump("UNLOCK + suffix wire (v2 seq 12)", wire, (size_t)w);
+    }
+  }
+  /* Command bytes agreed with the bridge (Phase 4). */
+  CHECK(NUKI_UART_CMD_UPDATE_TIME == 0x13);
+  CHECK(NUKI_UART_CMD_VERIFY_PIN == 0x14);
+  CHECK(NUKI_UART_CMD_SET_ACTION_SUFFIX == 0x15);
+  CHECK(NUKI_UART_CMD_LOCK_N_GO_UNLATCH == 0x08 &&
+        NUKI_UART_CMD_FULL_LOCK == 0x09 && NUKI_UART_CMD_FOB_3 == 0x0C);
+  CHECK(NUKI_UART_CMD_REQ_CONFIG == 0x20 && NUKI_UART_RSP_CONFIG == 0x86);
+}
+
+/* ── Keyturner States 0x000C (length-driven) ─────────────────────────── */
+
+static void test_keyturner(void) {
+  nuki_keyturner_t k;
+
+  /* Spec p.87 step 2e (2016 firmware): 13-byte payload, decrypted
+   * 020100E0070307080F1E3C0000 (the trailing 200A is the CRC) */
+  {
+    static const uint8_t b[] = {0x02, 0x01, 0x00, 0xE0, 0x07, 0x03, 0x07,
+                                0x08, 0x0F, 0x1E, 0x3C, 0x00, 0x00};
+    CHECK(nuki_uart_parse_keyturner(b, sizeof(b), &k) == NUKI_UART_OK);
+    CHECK(k.nuki_state == NUKI_NUKI_STATE_DOOR_MODE);
+    CHECK(k.lock_state == NUKI_LOCK_STATE_LOCKED && k.trigger == 0x00);
+    CHECK(k.has_time && k.time.year == 2016 && k.time.month == 3 &&
+          k.time.day == 7 && k.time.hour == 8 && k.time.minute == 15 &&
+          k.time.second == 30);
+    CHECK(k.tz_offset_min == 60);
+    CHECK(k.has_battery && !k.battery_critical && !k.battery_charging &&
+          k.battery_percent == 0);
+    CHECK(!k.has_config_update_count && !k.has_last_action &&
+          !k.has_door_sensor && !k.has_night_mode &&
+          !k.has_accessory_battery);
+  }
+  /* host-integration §13 step 5: 15 bytes, unlocking */
+  {
+    static const uint8_t b[] = {0x02, 0x02, 0x00, 0xE0, 0x07, 0x03, 0x07, 0x08,
+                                0x18, 0x20, 0x3C, 0x00, 0x00, 0x00, 0x07};
+    CHECK(nuki_uart_parse_keyturner(b, sizeof(b), &k) == NUKI_UART_OK);
+    CHECK(k.lock_state == NUKI_LOCK_STATE_UNLOCKING);
+    CHECK(k.has_config_update_count && k.config_update_count == 0);
+    CHECK(k.lock_n_go_timer == 7 && !k.has_last_action);
+  }
+  /* Full current layout (22 bytes): battery 84 % charging + critical,
+   * config count 5, last action unlock/manual/success, door closed,
+   * night mode on, keypad present + low, door sensor battery present ok */
+  {
+    uint8_t b[22] = {0x02, 0x03, 0x01, 0xEA, 0x07, 0x09, 0x07, 0x0C,
+                     0x22, 0x38, 0x3C, 0x00};
+    b[12] = (uint8_t)((42 << 2) | 0x02 | 0x01); /* 84 %, charging, critical */
+    b[13] = 5;
+    b[14] = 0;
+    b[15] = 0x01; /* unlock */
+    b[16] = 0x01; /* manual */
+    b[17] = 0x00; /* success */
+    b[18] = NUKI_DOOR_CLOSED;
+    b[19] = 1;
+    b[20] = NUKI_ACCESSORY_KEYPAD_SUPPORTED | NUKI_ACCESSORY_KEYPAD_CRITICAL |
+            NUKI_ACCESSORY_DOOR_SENSOR_SUPPORTED;
+    b[21] = 0x02; /* remote access: bridge paired */
+    CHECK(nuki_uart_parse_keyturner(b, sizeof(b), &k) == NUKI_UART_OK);
+    CHECK(k.battery_percent == 84 && k.battery_charging && k.battery_critical);
+    CHECK(k.has_config_update_count && k.config_update_count == 5);
+    CHECK(k.has_last_action && k.last_action == 0x01 &&
+          k.last_action_trigger == NUKI_TRIGGER_MANUAL);
+    CHECK(k.has_last_action_completion && k.last_action_completion == 0);
+    CHECK(k.has_door_sensor && k.door_sensor == NUKI_DOOR_CLOSED);
+    CHECK(k.has_night_mode && k.night_mode == 1);
+    CHECK(k.has_accessory_battery && k.keypad_present &&
+          k.keypad_battery_critical && k.door_sensor_battery_present &&
+          !k.door_sensor_battery_critical);
+    CHECK(k.has_remote_access && k.remote_access == 0x02);
+    /* the same frame cut after the door byte: night mode etc. absent */
+    CHECK(nuki_uart_parse_keyturner(b, 19, &k) == NUKI_UART_OK);
+    CHECK(k.has_door_sensor && !k.has_night_mode && !k.has_accessory_battery);
+    /* 100 % = 50 << 2 */
+    b[12] = 50 << 2;
+    CHECK(nuki_uart_parse_keyturner(b, 13, &k) == NUKI_UART_OK);
+    CHECK(k.battery_percent == 100 && !k.battery_critical);
+    /* pairing mode / maintenance mode names */
+    b[0] = NUKI_NUKI_STATE_PAIRING_MODE;
+    CHECK(nuki_uart_parse_keyturner(b, 2, &k) == NUKI_UART_OK);
+    CHECK(k.nuki_state == NUKI_NUKI_STATE_PAIRING_MODE && k.trigger == 0xFF &&
+          !k.has_time);
+    CHECK(strcmp(nuki_nuki_state_name(k.nuki_state), "pairingMode") == 0);
+    CHECK(strcmp(nuki_nuki_state_name(0x04), "maintenanceMode") == 0);
+    CHECK(strcmp(nuki_nuki_state_name(0x02), "doorMode") == 0);
+  }
+  /* errors */
+  {
+    static const uint8_t b[] = {0x02};
+    CHECK(nuki_uart_parse_keyturner(b, 1, &k) == NUKI_UART_ERR_SHORT);
+    CHECK(nuki_uart_parse_keyturner(NULL, 2, &k) == NUKI_UART_ERR_INVALID);
+  }
+  /* composite door security state */
+  CHECK(strcmp(nuki_door_security_state_name(NUKI_LOCK_STATE_LOCKED,
+                                             NUKI_DOOR_CLOSED),
+               "closedAndLocked") == 0);
+  CHECK(strcmp(nuki_door_security_state_name(NUKI_LOCK_STATE_UNLOCKED,
+                                             NUKI_DOOR_CLOSED),
+               "closedAndUnlocked") == 0);
+  CHECK(strcmp(nuki_door_security_state_name(NUKI_LOCK_STATE_LOCKED,
+                                             NUKI_DOOR_OPENED),
+               "open") == 0);
+}
+
+/* ── Config 0x0015 ───────────────────────────────────────────────────── */
+
+static size_t build_config(uint8_t *p, size_t tail) {
+  size_t o = 0;
+  p[o++] = 0x15;
+  p[o++] = 0x00;
+  nuki_uart_put_u32(p + o, 0x0A1B2C3D); /* nuki id */
+  o += 4;
+  o += put_name(p + o, "Front Door", 32);
+  memset(p + o, 0, 8); /* lat / lon */
+  o += 8;
+  p[o++] = 1;    /* auto unlatch */
+  p[o++] = 0;    /* pairing enabled */
+  p[o++] = 1;    /* button enabled */
+  p[o++] = 1;    /* led enabled */
+  p[o++] = 3;    /* led brightness */
+  o += put_ts(p + o, 2026, 9, 7, 12, 0, 0);
+  p[o++] = 0x78; /* tz offset 120 */
+  p[o++] = 0x00;
+  p[o++] = 1;    /* dst european */
+  p[o++] = 0;    /* has fob */
+  p[o++] = 1;    /* fob 1 unlock */
+  p[o++] = 2;    /* fob 2 lock */
+  p[o++] = 4;    /* fob 3 intelligent */
+  p[o++] = 0;    /* single lock */
+  p[o++] = 0;    /* advertising automatic */
+  p[o++] = 0;    /* has keypad */
+  p[o++] = 3;    /* fw 3.10.4 */
+  p[o++] = 10;
+  p[o++] = 4;
+  p[o++] = 2;    /* hw 2.1 */
+  p[o++] = 1;
+  p[o++] = 0;    /* homekit */
+  if (tail >= 2) {
+    p[o++] = 0x25; /* timezone id 37 */
+    p[o++] = 0x00;
+  }
+  if (tail >= 3) {
+    p[o++] = NUKI_CONFIG_DEVICE_ULTRA;
+  }
+  if (tail >= 4) {
+    p[o++] = 0x03; /* wifi + thread */
+  }
+  if (tail >= 5) {
+    p[o++] = 1; /* keypad 2.0 */
+  }
+  if (tail >= 6) {
+    p[o++] = 4; /* matter enabled & paired */
+  }
+  return o;
+}
+
+static void test_config(void) {
+  uint8_t f[96];
+  nuki_config_t c;
+
+  /* 72-byte base (API 1.x / 2.x through HomeKit status) */
+  {
+    size_t n = build_config(f, 0);
+    CHECK(n == 2 + NUKI_CONFIG_BASE_LEN && n == 74);
+    CHECK(nuki_uart_parse_config(f, n, &c) == NUKI_UART_OK);
+    CHECK(c.nuki_id == 0x0A1B2C3D);
+    CHECK(strcmp(c.name, "Front Door") == 0);
+    CHECK(c.auto_unlatch == 1 && c.pairing_enabled == 0 &&
+          c.button_enabled == 1 && c.led_enabled == 1 && c.led_brightness == 3);
+    CHECK(c.time.year == 2026 && c.time.hour == 12 && c.tz_offset_min == 120);
+    CHECK(c.dst_mode == 1 && c.has_fob == 0 && c.fob_action[2] == 4);
+    CHECK(c.single_lock == 0 && c.advertising_mode == 0 && c.has_keypad == 0);
+    CHECK(c.fw_version[0] == 3 && c.fw_version[1] == 10 &&
+          c.fw_version[2] == 4);
+    CHECK(c.hw_revision[0] == 2 && c.hw_revision[1] == 1);
+    CHECK(!c.has_timezone_id && !c.has_device_type && !c.has_capabilities &&
+          !c.has_keypad2_flag && !c.has_matter_status);
+    CHECK(nuki_config_keypad_paired(&c) == 0);
+    CHECK(nuki_config_uart_device_type(&c) == NUKI_UART_DEVICE_AUTO);
+    CHECK(nuki_uart_parse_config(f, n - 1, &c) == NUKI_UART_ERR_SHORT);
+  }
+  /* full 78-byte layout (API 2.3.1, Ultra with Keypad 2.0 and Matter) */
+  {
+    size_t n = build_config(f, 6);
+    CHECK(n == 80);
+    CHECK(nuki_uart_parse_config(f, n, &c) == NUKI_UART_OK);
+    CHECK(c.has_timezone_id && c.timezone_id == 37);
+    CHECK(c.has_device_type && c.device_type == NUKI_CONFIG_DEVICE_ULTRA);
+    CHECK(c.has_capabilities && c.capabilities == 0x03);
+    CHECK(c.has_keypad2_flag && c.has_keypad2 == 1);
+    CHECK(c.has_matter_status && c.matter_status == 4);
+    CHECK(nuki_config_keypad_paired(&c) == 1);
+    CHECK(nuki_config_uart_device_type(&c) == NUKI_UART_DEVICE_ULTRA);
+    CHECK(strcmp(nuki_config_device_type_name(c.device_type),
+                 "Smart Lock Ultra") == 0);
+    CHECK(strcmp(nuki_matter_status_name(c.matter_status), "enabledPaired") ==
+          0);
+    /* Ultra config -> uint32 PIN width */
+    CHECK(nuki_uart_pin_width(nuki_config_uart_device_type(&c)) == 4);
+  }
+  /* 3.0 / 4.0 without keypad 2 / matter fields: classic PIN width */
+  {
+    size_t n = build_config(f, 3);
+    f[2 + 74] = NUKI_CONFIG_DEVICE_SL_3_4;
+    CHECK(nuki_uart_parse_config(f, n, &c) == NUKI_UART_OK);
+    CHECK(c.has_device_type && !c.has_capabilities);
+    CHECK(nuki_config_uart_device_type(&c) == NUKI_UART_DEVICE_CLASSIC);
+    CHECK(nuki_uart_pin_width(nuki_config_uart_device_type(&c)) == 2);
+    f[2 + 74] = NUKI_CONFIG_DEVICE_OPENER;
+    CHECK(nuki_uart_parse_config(f, n, &c) == NUKI_UART_OK);
+    CHECK(nuki_config_uart_device_type(&c) == NUKI_UART_DEVICE_OPENER);
+  }
+  /* wrong id */
+  {
+    size_t n = build_config(f, 0);
+    f[0] = 0x14;
+    CHECK(nuki_uart_parse_config(f, n, &c) == NUKI_UART_ERR_INVALID);
+  }
 }
 
 /* ── Log Entry 0x0032 ────────────────────────────────────────────────── */
@@ -501,6 +829,9 @@ static void test_names(void) {
 int main(void) {
   test_pin();
   test_builders();
+  test_phase4_builders();
+  test_keyturner();
+  test_config();
   test_log_entry();
   test_keypad_code();
   test_auth_entry();

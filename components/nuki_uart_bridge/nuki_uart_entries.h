@@ -9,6 +9,10 @@
  * 0x0047 Keypad Code ID 0x0042 / Keypad Code Count 0x0044 / Keypad Code 0x0045
  *   Request Authorization Entries 0x0009 / Authorization Entry 0x000A /
  *   Authorization Entry Count 0x0027
+ *   Verify Security PIN 0x0020 / Update Time 0x0021 / Request Calibration
+ *   0x001A / Request Reboot 0x001D (PIN-terminated, no other fields)
+ *   Request Config 0x0014 / Config 0x0015 and the Keyturner States 0x000C
+ *   body (length-driven parsers, spec pp.30-35 and pp.42-46)
  *
  * Field layouts follow Nuki BLE API v2.3.1 (page numbers in the comments);
  * the UART placement rules follow docs/host-integration.md §7 of the bridge:
@@ -332,6 +336,54 @@ static inline size_t nuki_uart_build_set_state_poll(uint8_t *out,
   return 2U;
 }
 
+/*
+ * PIN-only commands: Verify Security PIN 0x0020 (p.47, UART 0x14), Request
+ * Calibration 0x001A (p.47, UART 0x70) and Request Reboot 0x001D (p.47-48,
+ * UART 0x73).  The bridge inserts nK in front of the PIN.  Returns the PIN
+ * width (2 or 4).
+ */
+static inline size_t nuki_uart_build_pin_only(uint8_t *out, uint32_t pin,
+                                              uint8_t device_type) {
+  return nuki_uart_put_pin(out, pin, device_type);
+}
+
+/*
+ * Update Time 0x0021 (p.48, UART 0x13): time(7) [nK] PIN.  Returns 7 + PIN
+ * width.  The lock keeps *local* time (Keyturner States carries the
+ * timezone offset separately), so callers pass the wall clock.
+ */
+static inline size_t nuki_uart_build_update_time(uint8_t *out,
+                                                 const nuki_ts_t *ts,
+                                                 uint32_t pin,
+                                                 uint8_t device_type) {
+  size_t n = 0;
+  nuki_uart_put_ts(out + n, ts);
+  n += NUKI_TS_LEN;
+  n += nuki_uart_put_pin(out + n, pin, device_type);
+  return n;
+}
+
+/* Lock Action name suffix (spec p.36): at most 20 bytes, no padding. */
+#define NUKI_ACTION_SUFFIX_LEN 20
+
+/*
+ * SET_ACTION_SUFFIX 0x15 payload and the optional trailing payload of the
+ * action commands: the suffix bytes without NUL and without padding.  An
+ * empty name gives an empty payload (= clear).  Returns the length (0..20).
+ */
+static inline size_t nuki_uart_build_action_suffix(uint8_t *out,
+                                                   const char *name) {
+  size_t n = 0;
+  if (name == NULL) {
+    return 0U;
+  }
+  while (n < NUKI_ACTION_SUFFIX_LEN && name[n] != '\0') {
+    out[n] = (uint8_t)name[n];
+    n++;
+  }
+  return n;
+}
+
 /* ── Entry parsers (input = UART DATA: [cmd_id:2 LE][payload]) ───────── */
 
 /* Log Entry 0x0032 (spec pp.50-52). */
@@ -595,6 +647,273 @@ static inline int nuki_uart_parse_auth_count(const uint8_t *data, size_t len,
   return NUKI_UART_OK;
 }
 
+/* ── Keyturner States 0x000C (spec pp.30-35) ─────────────────────────── */
+
+/*
+ * Byte offsets inside the payload.  The 2016 worked example (p.87 step 2e)
+ * stops after the battery byte (13 bytes); every later field is optional
+ * and reported through the has_* flags.
+ */
+#define NUKI_KS_OFF_NUKI_STATE 0
+#define NUKI_KS_OFF_LOCK_STATE 1
+#define NUKI_KS_OFF_TRIGGER 2
+#define NUKI_KS_OFF_TIME 3
+#define NUKI_KS_OFF_TZ_OFFSET 10
+#define NUKI_KS_OFF_BATTERY 12
+#define NUKI_KS_OFF_CONFIG_UPDATE_COUNT 13
+#define NUKI_KS_OFF_LOCK_N_GO_TIMER 14
+#define NUKI_KS_OFF_LAST_ACTION 15
+#define NUKI_KS_OFF_LAST_ACTION_TRIGGER 16
+#define NUKI_KS_OFF_LAST_ACTION_COMPLETION 17
+#define NUKI_KS_OFF_DOOR_SENSOR 18
+#define NUKI_KS_OFF_NIGHT_MODE 19
+#define NUKI_KS_OFF_ACCESSORY_BATTERY 20
+#define NUKI_KS_OFF_REMOTE_ACCESS 21
+
+typedef struct {
+  uint8_t nuki_state;
+  uint8_t lock_state;
+  uint8_t trigger; /* 0xFF when absent */
+  nuki_ts_t time;  /* valid when has_time */
+  int16_t tz_offset_min;
+  uint8_t has_time;
+  uint8_t has_battery;
+  uint8_t battery_critical;
+  uint8_t battery_charging;
+  uint8_t battery_percent; /* 0..100 in steps of 2 */
+  uint8_t has_config_update_count;
+  uint8_t config_update_count;
+  uint8_t lock_n_go_timer;
+  uint8_t has_last_action;
+  uint8_t last_action;
+  uint8_t last_action_trigger;
+  uint8_t has_last_action_completion;
+  uint8_t last_action_completion;
+  uint8_t has_door_sensor;
+  uint8_t door_sensor;
+  uint8_t has_night_mode;
+  uint8_t night_mode;
+  uint8_t has_accessory_battery;
+  uint8_t keypad_present;
+  uint8_t keypad_battery_critical;
+  uint8_t door_sensor_battery_present;
+  uint8_t door_sensor_battery_critical;
+  uint8_t has_remote_access;
+  uint8_t remote_access; /* raw bitmask, p.33 */
+} nuki_keyturner_t;
+
+/* Input = the body after the [0C 00] command id (nuki_uart_keyturner_body). */
+static inline int nuki_uart_parse_keyturner(const uint8_t *body, size_t len,
+                                            nuki_keyturner_t *k) {
+  if (body == NULL || k == NULL) {
+    return NUKI_UART_ERR_INVALID;
+  }
+  if (len < 2U) {
+    return NUKI_UART_ERR_SHORT;
+  }
+  memset(k, 0, sizeof(*k));
+  k->trigger = 0xFF;
+  k->nuki_state = body[NUKI_KS_OFF_NUKI_STATE];
+  k->lock_state = body[NUKI_KS_OFF_LOCK_STATE];
+  if (len > NUKI_KS_OFF_TRIGGER) {
+    k->trigger = body[NUKI_KS_OFF_TRIGGER];
+  }
+  if (len >= NUKI_KS_OFF_TZ_OFFSET + 2U) {
+    k->has_time = 1U;
+    nuki_uart_get_ts(body + NUKI_KS_OFF_TIME, &k->time);
+    k->tz_offset_min = (int16_t)nuki_uart_get_u16(body + NUKI_KS_OFF_TZ_OFFSET);
+  }
+  if (len > NUKI_KS_OFF_BATTERY) {
+    const uint8_t b = body[NUKI_KS_OFF_BATTERY];
+    k->has_battery = 1U;
+    k->battery_critical = (b & NUKI_BATTERY_CRITICAL_BIT) != 0U;
+    k->battery_charging = (b & NUKI_BATTERY_CHARGING_BIT) != 0U;
+    k->battery_percent = (uint8_t)(((b >> 2) & 0x3FU) * 2U);
+  }
+  if (len > NUKI_KS_OFF_CONFIG_UPDATE_COUNT) {
+    k->has_config_update_count = 1U;
+    k->config_update_count = body[NUKI_KS_OFF_CONFIG_UPDATE_COUNT];
+  }
+  if (len > NUKI_KS_OFF_LOCK_N_GO_TIMER) {
+    k->lock_n_go_timer = body[NUKI_KS_OFF_LOCK_N_GO_TIMER];
+  }
+  if (len > NUKI_KS_OFF_LAST_ACTION_TRIGGER) {
+    k->has_last_action = 1U;
+    k->last_action = body[NUKI_KS_OFF_LAST_ACTION];
+    k->last_action_trigger = body[NUKI_KS_OFF_LAST_ACTION_TRIGGER];
+  }
+  if (len > NUKI_KS_OFF_LAST_ACTION_COMPLETION) {
+    k->has_last_action_completion = 1U;
+    k->last_action_completion = body[NUKI_KS_OFF_LAST_ACTION_COMPLETION];
+  }
+  if (len > NUKI_KS_OFF_DOOR_SENSOR) {
+    k->has_door_sensor = 1U;
+    k->door_sensor = body[NUKI_KS_OFF_DOOR_SENSOR];
+  }
+  if (len > NUKI_KS_OFF_NIGHT_MODE) {
+    k->has_night_mode = 1U;
+    k->night_mode = body[NUKI_KS_OFF_NIGHT_MODE] != 0U;
+  }
+  if (len > NUKI_KS_OFF_ACCESSORY_BATTERY) {
+    const uint8_t a = body[NUKI_KS_OFF_ACCESSORY_BATTERY];
+    k->has_accessory_battery = 1U;
+    k->keypad_present = (a & NUKI_ACCESSORY_KEYPAD_SUPPORTED) != 0U;
+    k->keypad_battery_critical = (a & NUKI_ACCESSORY_KEYPAD_CRITICAL) != 0U;
+    k->door_sensor_battery_present =
+        (a & NUKI_ACCESSORY_DOOR_SENSOR_SUPPORTED) != 0U;
+    k->door_sensor_battery_critical =
+        (a & NUKI_ACCESSORY_DOOR_SENSOR_CRITICAL) != 0U;
+  }
+  if (len > NUKI_KS_OFF_REMOTE_ACCESS) {
+    k->has_remote_access = 1U;
+    k->remote_access = body[NUKI_KS_OFF_REMOTE_ACCESS];
+  }
+  return NUKI_UART_OK;
+}
+
+/* ── Config 0x0015 (spec pp.42-46) ───────────────────────────────────── */
+
+/*
+ * The first 72 bytes (up to HomeKit status) exist on every generation; the
+ * Timezone ID, Device Type, Capabilities, Has Keypad 2 and Matter status
+ * were appended by later API versions (change log p.90) and are reported
+ * through has_* flags.  Latitude / longitude are skipped (privacy, and the
+ * host has no use for them).
+ */
+#define NUKI_CONFIG_BASE_LEN 72
+#define NUKI_CONFIG_NAME_LEN 32
+
+/* Config "Device Type" (p.45) */
+#define NUKI_CONFIG_DEVICE_SL_1_2 0x00
+#define NUKI_CONFIG_DEVICE_OPENER 0x02
+#define NUKI_CONFIG_DEVICE_SMART_DOOR 0x03
+#define NUKI_CONFIG_DEVICE_SL_3_4 0x04
+#define NUKI_CONFIG_DEVICE_ULTRA 0x05
+
+typedef struct {
+  uint32_t nuki_id;
+  char name[NUKI_CONFIG_NAME_LEN + 1];
+  uint8_t auto_unlatch;
+  uint8_t pairing_enabled;
+  uint8_t button_enabled;
+  uint8_t led_enabled;
+  uint8_t led_brightness;
+  nuki_ts_t time;
+  int16_t tz_offset_min;
+  uint8_t dst_mode;
+  uint8_t has_fob;
+  uint8_t fob_action[3];
+  uint8_t single_lock;
+  uint8_t advertising_mode;
+  uint8_t has_keypad;
+  uint8_t fw_version[3]; /* major.minor.patch */
+  uint8_t hw_revision[2];
+  uint8_t homekit_status;
+  uint8_t has_timezone_id;
+  uint16_t timezone_id;
+  uint8_t has_device_type;
+  uint8_t device_type; /* NUKI_CONFIG_DEVICE_* */
+  uint8_t has_capabilities;
+  uint8_t capabilities; /* bit0 WiFi, bit1 Thread/Matter */
+  uint8_t has_keypad2_flag;
+  uint8_t has_keypad2;
+  uint8_t has_matter_status;
+  uint8_t matter_status;
+} nuki_config_t;
+
+/* Input = UART DATA of a 0x86 frame: [15 00][Config payload]. */
+static inline int nuki_uart_parse_config(const uint8_t *data, size_t len,
+                                         nuki_config_t *c) {
+  const uint8_t *p;
+  size_t n;
+
+  if (data == NULL || c == NULL) {
+    return NUKI_UART_ERR_INVALID;
+  }
+  if (len < 2U || nuki_uart_get_u16(data) != NUKI_CMD_ID_CONFIG) {
+    return NUKI_UART_ERR_INVALID;
+  }
+  p = data + 2;
+  n = len - 2U;
+  if (n < NUKI_CONFIG_BASE_LEN) {
+    return NUKI_UART_ERR_SHORT;
+  }
+  memset(c, 0, sizeof(*c));
+  c->nuki_id = nuki_uart_get_u32(p);
+  nuki_uart_copy_name(c->name, sizeof(c->name), p + 4, NUKI_CONFIG_NAME_LEN);
+  /* p + 36 .. 43: latitude, longitude (float) — not decoded */
+  c->auto_unlatch = p[44];
+  c->pairing_enabled = p[45];
+  c->button_enabled = p[46];
+  c->led_enabled = p[47];
+  c->led_brightness = p[48];
+  nuki_uart_get_ts(p + 49, &c->time);
+  c->tz_offset_min = (int16_t)nuki_uart_get_u16(p + 56);
+  c->dst_mode = p[58];
+  c->has_fob = p[59];
+  c->fob_action[0] = p[60];
+  c->fob_action[1] = p[61];
+  c->fob_action[2] = p[62];
+  c->single_lock = p[63];
+  c->advertising_mode = p[64];
+  c->has_keypad = p[65];
+  c->fw_version[0] = p[66];
+  c->fw_version[1] = p[67];
+  c->fw_version[2] = p[68];
+  c->hw_revision[0] = p[69];
+  c->hw_revision[1] = p[70];
+  c->homekit_status = p[71];
+  if (n >= 74U) {
+    c->has_timezone_id = 1U;
+    c->timezone_id = nuki_uart_get_u16(p + 72);
+  }
+  if (n >= 75U) {
+    c->has_device_type = 1U;
+    c->device_type = p[74];
+  }
+  if (n >= 76U) {
+    c->has_capabilities = 1U;
+    c->capabilities = p[75];
+  }
+  if (n >= 77U) {
+    c->has_keypad2_flag = 1U;
+    c->has_keypad2 = p[76];
+  }
+  if (n >= 78U) {
+    c->has_matter_status = 1U;
+    c->matter_status = p[77];
+  }
+  return NUKI_UART_OK;
+}
+
+/* A keypad is paired when either generation flag is set (Keypad 1 / 2.0). */
+static inline int nuki_config_keypad_paired(const nuki_config_t *c) {
+  return c->has_keypad != 0U || (c->has_keypad2_flag && c->has_keypad2 != 0U);
+}
+
+/*
+ * Map the Config device type onto the bridge's PAIR/diagnostics device
+ * type: 0x05 Ultra -> NUKI_UART_DEVICE_ULTRA, every other smart lock ->
+ * CLASSIC (uint16 PIN), opener -> OPENER.  0 (AUTO) when unknown.
+ */
+static inline uint8_t nuki_config_uart_device_type(const nuki_config_t *c) {
+  if (!c->has_device_type) {
+    return NUKI_UART_DEVICE_AUTO;
+  }
+  switch (c->device_type) {
+  case NUKI_CONFIG_DEVICE_ULTRA:
+    return NUKI_UART_DEVICE_ULTRA;
+  case NUKI_CONFIG_DEVICE_OPENER:
+    return NUKI_UART_DEVICE_OPENER;
+  case NUKI_CONFIG_DEVICE_SL_1_2:
+  case NUKI_CONFIG_DEVICE_SMART_DOOR:
+  case NUKI_CONFIG_DEVICE_SL_3_4:
+    return NUKI_UART_DEVICE_CLASSIC;
+  default:
+    return NUKI_UART_DEVICE_AUTO;
+  }
+}
+
 /* ── Name tables ─────────────────────────────────────────────────────── */
 /*
  * Strings match the ones the NukiBleEsp32-based ESPHome component emits in
@@ -769,6 +1088,72 @@ static inline const char *nuki_door_sensor_state_name(uint8_t state) {
   default:
     return "undefined";
   }
+}
+
+/* Keyturner States byte 0 (p.30) */
+static inline const char *nuki_nuki_state_name(uint8_t state) {
+  switch (state) {
+  case NUKI_NUKI_STATE_UNINITIALIZED:
+    return "uninitialized";
+  case NUKI_NUKI_STATE_PAIRING_MODE:
+    return "pairingMode";
+  case NUKI_NUKI_STATE_DOOR_MODE:
+    return "doorMode";
+  case NUKI_NUKI_STATE_MAINTENANCE_MODE:
+    return "maintenanceMode";
+  default:
+    return "undefined";
+  }
+}
+
+/* Config "Device Type" (p.45) */
+static inline const char *nuki_config_device_type_name(uint8_t t) {
+  switch (t) {
+  case NUKI_CONFIG_DEVICE_SL_1_2:
+    return "Smart Lock 1.0/2.0";
+  case NUKI_CONFIG_DEVICE_OPENER:
+    return "Opener";
+  case NUKI_CONFIG_DEVICE_SMART_DOOR:
+    return "Smart Door";
+  case NUKI_CONFIG_DEVICE_SL_3_4:
+    return "Smart Lock 3.0/4.0";
+  case NUKI_CONFIG_DEVICE_ULTRA:
+    return "Smart Lock Ultra";
+  default:
+    return "unknown";
+  }
+}
+
+/* Config "Matter status" (p.46) */
+static inline const char *nuki_matter_status_name(uint8_t s) {
+  switch (s) {
+  case 0x00:
+    return "notAvailable";
+  case 0x01:
+    return "disabled";
+  case 0x02:
+    return "disabledLegacy";
+  case 0x03:
+    return "enabled";
+  case 0x04:
+    return "enabledPaired";
+  default:
+    return "undefined";
+  }
+}
+
+/*
+ * Composite door security state (same three values as hass_nuki_ng's
+ * `door_security_state` sensor): locked + closed, closed but not locked,
+ * everything else (open, unknown sensor, ...).
+ */
+static inline const char *nuki_door_security_state_name(uint8_t lock_state,
+                                                        uint8_t door_state) {
+  if (door_state == NUKI_DOOR_CLOSED) {
+    return lock_state == NUKI_LOCK_STATE_LOCKED ? "closedAndLocked"
+                                                : "closedAndUnlocked";
+  }
+  return "open";
 }
 
 #ifdef __cplusplus

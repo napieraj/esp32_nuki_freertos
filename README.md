@@ -93,28 +93,76 @@ lock:
     auto_pair: true      # send PAIR once at boot if the bridge reports no credentials
     secure_link: auto    # auto | true | false — sealed UART transport (see below)
     state_poll_interval: 60s  # bridge-side Keyturner States read cadence (SET_STATE_POLL 0x7A)
+    time_id: sntp_time   # optional: Update Time 0x0021 daily and after every time sync
+    pairing_mode_timeout: 300s  # how long the pairing_mode switch keeps retrying PAIR
+    allowed_actions: [unlock, lock, unlatch, lock_n_go, lock_n_go_unlatch, full_lock, fob_1, fob_2, fob_3]
+    action_suffix: ""    # Lock Action name suffix (<= 20 bytes) shown in the lock's log; "" = friendly name
     event: nuki_event    # fire `esphome.nuki_event` in HA for every new log entry; "none" = off
     event_log_count: 5   # newest entries fetched after each lock/unlock/door change (1-50)
-    connected:           # optional binary_sensor: bridge BLE state == CONNECTED
+    connected:           # binary_sensor: bridge BLE state == CONNECTED
       name: "Front Door Nuki Connected"
-    rssi:                # optional sensor (dBm), from CONN_STATUS events
+    paired:              # binary_sensor: bridge holds credentials (diagnostics creds_valid / STATUS)
+      name: "Front Door Nuki Paired"
+    rssi:                # sensor (dBm), from CONN_STATUS events
       name: "Front Door Nuki RSSI"
-    diagnostics:         # optional text_sensor summarising REQ_DIAGNOSTICS
+    diagnostics:         # text_sensor summarising REQ_DIAGNOSTICS
       name: "Front Door Nuki Bridge Diagnostics"
+    pin_status:          # text_sensor: Not set | Validation pending | Valid | Invalid
+      name: "Front Door Nuki PIN Status"
+    nuki_state:          # text_sensor: uninitialized | pairingMode | doorMode | maintenanceMode
+      name: "Front Door Nuki State"
+    firmware_version:    # text_sensors from Config 0x0015 (read on connect and on config changes)
+      name: "Front Door Nuki Firmware"
+    hardware_version:
+      name: "Front Door Nuki Hardware"
+    lock_name:
+      name: "Front Door Nuki Name"
+    nuki_id:             # hex, as the Nuki Bridge / Web API present it
+      name: "Front Door Nuki ID"
+    keypad_paired:       # binary_sensor: Config has_keypad || has_keypad2
+      name: "Front Door Nuki Keypad Paired"
+    battery_level:       # sensor (%): Keyturner States byte 12 bits 2-7 (steps of 2)
+      name: "Front Door Nuki Battery"
+    battery_critical:    # binary_sensor: byte 12 bit 0
+      name: "Front Door Nuki Battery Critical"
+    battery_charging:    # binary_sensor: byte 12 bit 1
+      name: "Front Door Nuki Battery Charging"
+    keypad_battery_critical:       # binary_sensor: accessory byte 20 bit 1 (unavailable when no keypad, bit 0)
+      name: "Front Door Nuki Keypad Battery Critical"
+    door_sensor_battery_critical:  # binary_sensor: byte 20 bit 3 (unavailable without a door sensor, bit 2)
+      name: "Front Door Sensor Battery Critical"
     last_unlock_user:    # text_sensor: authorization name of the newest lock/keypad log entry
       name: "Front Door Nuki Last Unlock User"
     last_lock_action:    # text_sensor: Keyturner States "last lock action" (Unlock, Lock, ...)
       name: "Front Door Nuki Last Lock Action"
     last_lock_action_trigger:  # text_sensor: its trigger (system, manual, button, autoLock, ...)
       name: "Front Door Nuki Last Lock Action Trigger"
+    last_lock_action_completion_status:  # text_sensor: success, motorBlocked, busy, invalidCode, ...
+      name: "Front Door Nuki Last Lock Action Completion"
+    night_mode:          # binary_sensor: Keyturner States byte 19
+      name: "Front Door Nuki Night Mode"
     door_sensor:         # binary_sensor (door): 0x03 opened = ON, 0x02 closed = OFF, else unavailable
       name: "Front Door"
     door_sensor_state:   # text_sensor with the spec names (doorClosed, doorOpened, uncalibrated, tampered, ...)
       name: "Front Door Sensor State"
+    door_security_state: # text_sensor: closedAndLocked | closedAndUnlocked | open | unknown (as hass_nuki_ng)
+      name: "Front Door Security State"
     tamper:              # binary_sensor (tamper): ON while the door sensor reports 0xF0 Tampered
       name: "Front Door Sensor Tamper"
+    pairing_mode:        # switch: PAIR now, retry every 5 s, off after pairing_mode_timeout / PAIRING_COMPLETE
+      name: "Front Door Nuki Pairing Mode"
+    unpair:              # button: UNPAIR 0x74 (with the PIN when configured)
+      name: "Front Door Nuki Unpair"
+    request_calibration: # button: Request Calibration 0x001A (PIN)
+      name: "Front Door Nuki Calibrate"
+    reboot:              # button: Request Reboot 0x001D (PIN)
+      name: "Front Door Nuki Reboot"
     on_pairing_complete: # x = auth_id (uint32)
       - logger.log: "paired"
+    on_pairing_mode_on:
+      - logger.log: "pairing mode on"
+    on_pairing_mode_off:
+      - logger.log: "pairing mode off"
     on_state_change:     # x = raw Nuki lock state byte (spec p.31)
       - logger.log: "state changed"
     on_event_log:        # entry = nuki_log_entry_t (index, ts, auth_id, name, type, data[])
@@ -125,14 +173,91 @@ lock:
       - logger.log: "door changed"
 ```
 
+Automation actions: `nuki_uart_bridge.pair`, `.unpair`,
+`.set_pairing_mode: {pairing_mode: true}`, `.set_security_pin:
+{security_pin: 123456}` (runtime override, persisted in preferences, `0`
+clears it — the fork's `nuki_lock.set_security_pin`), `.verify_pin`,
+`.update_time`, `.request_calibration`, `.reboot`, `.lock_n_go: {unlatch:
+false, suffix: "Alice"}` and `.lock_action: {action: fob_1, suffix: ...}`
+(`action` is one of the `allowed_actions` names).  Conditions:
+`nuki_uart_bridge.paired`, `nuki_uart_bridge.connected`.
+
 Lambda-callable helpers: `id(front_door).pair()`, `.unpair()` (sends the
 PIN if configured so the bridge can remove its authorization from the
-lock), `.request_diagnostics()`, `.request_lock_state()`,
+lock), `.set_pairing_mode(bool)`, `.request_diagnostics()`,
+`.request_lock_state()`, `.request_config()`,
 `.set_runtime_link_profile(0|1)`, `.set_runtime_state_poll(seconds)`,
 `.request_event_logs(n)`, `.print_keypad_entries()`,
 `.add_keypad_entry(name, code)`, `.update_keypad_entry(id, name, code,
-enabled)`, `.delete_keypad_entry(id)`, `.pair_host()` / `.unpair_host()`
+enabled)`, `.delete_keypad_entry(id)`, `.lock_n_go(unlatch)`,
+`.full_lock()`, `.fob_action(1..3)`, `.lock_action(cmd, suffix)`,
+`.set_security_pin(pin)`, `.verify_pin()`, `.update_time()`,
+`.request_calibration()`, `.request_reboot()`,
+`.set_runtime_action_suffix(name)`, `.pair_host()` / `.unpair_host()`
 (secure link).  `lock.open` maps to UNLATCH.
+
+`pair_as: bridge` **evicts the official Nuki Bridge**: a lock holds exactly
+one Bridge-type authorization, so pairing as Bridge unregisters the Nuki
+Bridge (ESPHome_nuki_lock README, nuki_hub README) — keep the default
+`app` if a Nuki Bridge stays in use.  The flip side (nuki_hub `HYBRID.md`):
+the lock only raises the "state changed" beacon bit for a Bridge-type
+authorization, so a host paired as App relies on `state_poll_interval`
+for manual turns; Ultra / Go / 5.0 Pro accept no Bridge registration at
+all.
+
+### Actions, retries and the guard window
+
+* `allowed_actions` is an ACL checked before anything is sent (nuki_hub's
+  per-action ACL); a refused action re-publishes the current state so HA
+  does not stay optimistic.
+* For **6 s after the bridge link comes up and after every Home Assistant
+  API (re)connect** lock calls are ignored (nuki_hub's post-connect
+  replay guard: a reconnecting HA can flush stale service calls).
+* An action that never reached the lock — `ERROR 0x22 NOT_CONNECTED`, or
+  `0x20 TIMEOUT` without a *Status ACCEPTED* — is re-sent **once** after
+  the next `CONNECTED` inside a 10 s window.  Anything the lock may have
+  acted on is never re-sent (pyNukiBT sends a Lock Action exactly once;
+  a repeat would double-actuate or hit `K_ERROR_BAD_NONCE`).
+* Transition watchdog: *ACCEPTED* but no settled `0x85` within 5 s →
+  `REQ_LOCK_STATE` (the state push can be lost across a reconnect).
+* Nuki state (Keyturner States byte 0) other than *door mode* → the entity
+  reports unknown, like the core `nuki` integration's `ERROR_STATES`.
+* Every action carries the **name suffix** (`SET_ACTION_SUFFIX 0x15`,
+  default = the ESPHome friendly name; `set_action_suffix` service to
+  change it at runtime, e.g. from an HA automation that knows the calling
+  user), so the lock's own log names the actor.  A per-call `suffix` on
+  `lock_n_go` / `lock_action` is sent as the action's payload instead.
+  ESPHome's native API gives a custom service no user context, so the HA
+  side has to pass the name explicitly.
+
+### Security PIN lifecycle
+
+`pin_status` follows the BLE component: *Not set* → *Validation pending*
+(PIN known) → *Valid* / *Invalid*.  After boot, after every pairing and
+after `set_security_pin` the host sends `VERIFY_PIN 0x14` (Verify Security
+PIN 0x0020, `[PIN]` = `14 <seq> 98 FF 00 00` for Ultra PIN 065432) as soon
+as the bridge is connected and the PIN width is known; *Status COMPLETE*
+marks it valid (persisted), `K_ERROR_BAD_PIN` / `K_ERROR_TOO_MANY_PIN_
+ATTEMPTS` from **any** PIN command mark it invalid and block every
+further PIN command (keypad, log, calibration, time) until
+`set_security_pin` / `verify_pin` succeed — the lock locks the PIN out
+after repeated failures (spec p.76).  A bridge without `0x14`
+(`UNKNOWN_CMD`) leaves the state at *Validation pending* and does not
+block anything.  `security_pin` accepts 1-6 digits (leading zeros are
+kept in YAML, the PIN is a number: `"000548"` = 548); `device_type:
+classic` rejects values above 65535 at config time.
+
+### Lock time
+
+With `time_id`, `UPDATE_TIME 0x13` = Update Time 0x0021 is sent 30 s after
+every time sync and once a day: `[year LE16][month][day][hour][min][sec]
++ PIN`, e.g. `13 09 00 EA 07 09 07 0C 22 38 98 FF 00 00` for 2026-09-07
+12:34:56 on an Ultra, SEQ 9.  The wall clock of the configured timezone
+is sent — the lock keeps local time and reports its timezone offset
+separately (Keyturner States, Config), which is what nuki_hub does;
+pyNukiBT sends UTC instead, so if the lock's log timestamps come out
+shifted by the UTC offset on your firmware, set `timezone: UTC` on the
+`time:` component.  Years before 2025 are refused (NTP not synced yet).
 
 ### Keypad, event log and door sensor
 
@@ -147,6 +272,12 @@ true`; events additionally need `api: homeassistant_services: true`.
 | `delete_keypad_entry` | `id` | `0x54 REMOVE_KEYPAD` = Remove Keypad Code 0x0047 + PIN |
 | `print_keypad_entries` | – | `0x51 REQ_KEYPAD_CODES` (offset 0, count 0xFFFF) + PIN; every `0x89` entry is logged (id, name, enabled, lock count, dates — never the code) |
 | `request_event_logs` | `count` (1-50) | `0x40 REQ_LOG_ENTRIES` (start 0, descending, no count frame) + PIN; every `0x88` entry is parsed |
+| `lock_n_go` | `unlatch` (bool) | `0x06 LOCK_N_GO` / `0x08 LOCK_N_GO_UNLATCH` (Lock Action 0x04 / 0x05), the `nuki.lock_n_go` semantics of HA core |
+| `full_lock` | – | `0x09 FULL_LOCK` (Lock Action 0x06) |
+| `fob_action` | `n` (1-3) | `0x0A`-`0x0C FOB_1..3` (Lock Action 0x81-0x83) |
+| `update_time` | – | `0x13 UPDATE_TIME` = Update Time 0x0021 `[time:7]` + PIN (needs `time_id`) |
+| `verify_pin` | – | `0x14 VERIFY_PIN` = Verify Security PIN 0x0020, PIN only |
+| `set_action_suffix` | `name` (<= 20 bytes) | `0x15 SET_ACTION_SUFFIX [name]`, ACK only; used by every following action |
 | `pair_host` | – | secure-link bootstrap, see below |
 
 Payloads follow the bridge rule "spec fields minus nK, PIN last": the PIN
@@ -183,8 +314,18 @@ entry, resolved through the authorization list (`0x30 REQ_AUTH_ENTRIES`
 then the name inside the entry, then `Manual`; a Keyturner States with
 trigger `manual` also sets it to `Manual`.
 
+Config: `REQ_CONFIG 0x20` (Request Config 0x0014, nK only) is sent after
+every connect and again whenever the Keyturner States *config update
+count* (byte 13) changes (pyNukiBT / RaspiNukiBridge use it as a cache
+invalidation counter); the `0x86` reply is parsed length-driven (72-byte
+base through HomeKit status, then timezone id, device type, capabilities,
+keypad 2.0 and Matter status when present) and feeds `firmware_version`,
+`hardware_version`, `lock_name`, `nuki_id`, `keypad_paired`.  The Config
+*device type* (0x05 Ultra) is the authoritative generation for the PIN
+width once read, ahead of the bridge's advertisement-based classification.
+
 Door sensor: the Keyturner States byte 18 feeds `door_sensor`,
-`door_sensor_state`, `tamper` and `on_door_state`.  The 1.0-2.0 and
+`door_sensor_state`, `tamper`, `door_security_state` and `on_door_state`.  The 1.0-2.0 and
 3.0-Ultra value sets do not overlap, so one table names both
 (`unavailable`, `deactivated`, `doorClosed`, `doorOpened`,
 `doorStateUnknown`, `calibrating`, `uncalibrated`, `tampered`, `unknown`).
@@ -240,11 +381,14 @@ example.  Validate with `make config-uart`, build with `make compile-uart`.
   `0x90` with `selected = 1` means the bridge rebooted: in-flight requests
   are dropped and HELLO is renegotiated.  HELLO is retried with backoff
   (1 → 8 s) and the link is declared lost after 90 s without any frame.
-* Commands: UNLOCK 0x01, LOCK 0x02, UNLATCH 0x03, REQ_LOCK_STATE 0x10,
-  PAIR 0x05 `[device_type][pin LE32][id_type][app_id LE32]` (trailing
-  defaults omitted), UNPAIR 0x74 `[pin LE32]?`, SET_LINK_PROFILE 0x76,
-  PING 0x7C every 30 s (bridge marks the host stale after 120 s),
-  REQ_DIAGNOSTICS 0x7E.
+* Commands: UNLOCK 0x01, LOCK 0x02, UNLATCH 0x03, LOCK_N_GO 0x06,
+  LOCK_N_GO_UNLATCH 0x08, FULL_LOCK 0x09, FOB_1..3 0x0A-0x0C (each with
+  an optional name-suffix payload), REQ_LOCK_STATE 0x10, UPDATE_TIME 0x13,
+  VERIFY_PIN 0x14, SET_ACTION_SUFFIX 0x15, REQ_CONFIG 0x20, PAIR 0x05
+  `[device_type][pin LE32][id_type][app_id LE32]` (trailing defaults
+  omitted), REQ_CALIBRATION 0x70 / REQ_REBOOT 0x73 (PIN only), UNPAIR
+  0x74 `[pin LE32]?`, SET_LINK_PROFILE 0x76, PING 0x7C every 30 s (bridge
+  marks the host stale after 120 s), REQ_DIAGNOSTICS 0x7E.
 * Responses: ACK 0x80, ERROR 0x82 (error byte named in the log; a failed
   action publishes `NONE` and re-requests the state), STATUS 0x81
   (`[0E 00 01]` = Nuki *Status ACCEPTED* for the action's SEQ, or a raw
@@ -252,9 +396,15 @@ example.  Validate with `make config-uart`, build with `make compile-uart`.
   length-driven parse: byte 1 = lock state → ESPHome state, `0xFE` motor
   blocked → `JAMMED`), ERROR_REPORT 0x8E (Nuki error named in the log),
   CONN_STATUS 0x8D (state / RSSI / host-link / beacon), PAIRING_COMPLETE
-  0x83, DIAGNOSTICS 0x8C v0x03 and v0x04 (device type, MTU, counters,
-  armed engine state, connection interval and the three armed-path latency
-  stages are logged; a summary goes to the `diagnostics` text sensor).
+  0x83, CONFIG 0x86 (`[15 00][Config]`), DIAGNOSTICS 0x8C v0x03, v0x04
+  and v0x05 (device type, MTU, counters, armed engine state, connection
+  interval, the three armed-path latency stages, secure-link state and PIN
+  flags are logged; a summary goes to the `diagnostics` text sensor).
+* Keyturner States (`nuki_uart_parse_keyturner()`): nuki state, lock
+  state, trigger, battery (level / critical / charging), config update
+  count, last action / trigger / completion status, door sensor, night
+  mode and accessory battery bits, each gated on the payload length (the
+  2016 example on spec p.87 is 13 bytes, current firmware sends 22+).
 * Latency: `lock`/`unlock`/`open` write the frame **immediately from
   `control()`** on the ESPHome main loop and publish the optimistic
   `LOCKING`/`UNLOCKING` state; the confirmed state comes from the
@@ -262,6 +412,15 @@ example.  Validate with `make config-uart`, build with `make compile-uart`.
   ACCEPTED* and to the confirming Keyturner States.  `loop()` only drains
   the UART ring (bounded to 512 bytes per iteration) and runs timers — no
   blocking, no heap churn.
+
+### Latency compared with the other Home Assistant routes
+
+| Route | HA call → motor starts | Manual turn → HA | Why |
+|-------|------------------------|------------------|-----|
+| ESPHome_nuki_lock (NukiBleEsp32 on the ESP32) | ≥ 1.5-3 s | beacon bit → next 500 ms tick + connect | 500 ms poll tick, connect 2 s × 5 retries per command, challenge + action, 3 s cooldown after a lock action (`nuki_lock.h:46-57`) |
+| nuki_hub (MQTT) | ≈ 1-2 s | beacon → state read | same library; connect per command, 3 s command timeout, up to 4 retries |
+| Nuki Bridge HTTP API (HA core `nuki`, hass_nuki_ng) | 1-3 s | 30 s poll or bridge callback | `/lockAction` returns before the motor runs; state by polling / webhook |
+| **this component, armed link** | **< 60 ms** UART byte → *Status ACCEPTED* | one connection interval + `state_poll_interval` for the door sensor | persistent 7.5 ms link, pre-built encrypted frame, single GATT write (`docs/latency.md` on the bridge) |
 
 ## Requirements
 
@@ -298,7 +457,7 @@ Set `ESPHOME_WARM_COMPILE=0` to skip warm-up.
 | `make lint` | Run all linters (ruff + clang-format) |
 | `make config-uart` | Validate the UART-bridge YAML (`nuki-uart-bridge-test.yaml`) |
 | `make compile-uart` | Compile the UART-bridge firmware |
-| `make test-host` | Run the pure-C UART framing + entry parser tests with the host gcc |
+| `make test-host` | Run the pure-C UART framing + entry/Config/Keyturner parser tests with the host gcc |
 | `make format` | Auto-format all source files |
 | `make clean` | Remove build artifacts (keeps venv) |
 | `make clean-all` | Remove build artifacts, venv, and toolchain cache |

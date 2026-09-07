@@ -1,0 +1,79 @@
+esphome:
+  name: nuki-uart-bridge
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+ethernet:
+  type: W5500
+  clk_pin: GPIO12
+  mosi_pin: GPIO11
+  miso_pin: GPIO13
+  cs_pin: GPIO10
+  interrupt_pin: GPIO9
+  reset_pin: GPIO14
+
+api:
+
+logger:
+  baud_rate: 0  # keep UART0 free of log traffic when the bridge is on UART0
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+# UART to the XIAO nRF52840 bridge (D6/P1.11 = nRF TX, D7/P1.12 = nRF RX).
+# 921600 8N1 is the bridge default; use 115200 if the overlay is built with
+# the fallback rate.  A larger RX buffer absorbs bursts (state change +
+# diagnostics) between two ESPHome loop() iterations.
+uart:
+  id: nuki_uart
+  tx_pin: GPIO17
+  rx_pin: GPIO18
+  baud_rate: 921600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 1024
+
+lock:
+  - platform: nuki_uart_bridge
+    id: front_door
+    name: "Front Door Nuki"
+    uart_id: nuki_uart
+    pin: "065432"          # optional; required to pair an Ultra / 5th gen
+    device_type: auto      # auto | classic | ultra
+    pair_as: app           # app | bridge
+    link_profile: armed    # armed (low latency) | eco
+    # app_id: 2020002      # optional; bridge default when omitted
+    poll_interval: 60s     # REQ_LOCK_STATE cadence; changes also arrive unsolicited
+    auto_pair: true        # send PAIR once at boot when the bridge is unpaired
+    connected:
+      name: "Front Door Nuki Connected"
+    rssi:
+      name: "Front Door Nuki RSSI"
+    diagnostics:
+      name: "Front Door Nuki Bridge Diagnostics"
+    on_pairing_complete:
+      - logger.log:
+          format: "Paired with Nuki, auth_id=%u"
+          args: ["auth_id"]
+    on_state_change:
+      - logger.log:
+          format: "Nuki lock state byte 0x%02X"
+          args: ["lock_state"]
+
+button:
+  - platform: template
+    name: "Front Door Nuki Pair"
+    entity_category: config
+    on_press:
+      - lambda: id(front_door).pair();
+  - platform: template
+    name: "Front Door Nuki Diagnostics Refresh"
+    entity_category: diagnostic
+    on_press:
+      - lambda: id(front_door).request_diagnostics();

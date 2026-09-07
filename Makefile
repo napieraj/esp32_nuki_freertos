@@ -2,8 +2,10 @@ SHELL  := /usr/bin/env bash
 VENV   := .venv
 BIN    := $(VENV)/bin
 YAML   := nuki-lock-test.yaml
-PY_SRC := components/nuki_pro/*.py
-CXX_SRC:= components/nuki_pro/*.cpp components/nuki_pro/*.h
+UART_YAML := nuki-uart-bridge-test.yaml
+PY_SRC := components/nuki_pro/*.py components/nuki_uart_bridge/*.py
+CXX_SRC:= components/nuki_pro/*.cpp components/nuki_pro/*.h \
+          components/nuki_uart_bridge/*.cpp components/nuki_uart_bridge/*.h
 
 .DEFAULT_GOAL := help
 
@@ -26,6 +28,14 @@ config: ## Validate ESPHome YAML config
 .PHONY: compile
 compile: ## Compile firmware for ESP32-S3
 	$(BIN)/esphome compile $(YAML)
+
+.PHONY: config-uart
+config-uart: ## Validate the UART-bridge ESPHome YAML config
+	$(BIN)/esphome config $(UART_YAML)
+
+.PHONY: compile-uart
+compile-uart: ## Compile the UART-bridge firmware for ESP32-S3
+	$(BIN)/esphome compile $(UART_YAML)
 
 # ── Lint ──────────────────────────────────────────────────────────────────────
 
@@ -52,6 +62,17 @@ format-python: ## Auto-fix Python lint issues
 .PHONY: format-cpp
 format-cpp: ## Auto-format C++ source files
 	clang-format -i $(CXX_SRC)
+
+# ── Host tests ────────────────────────────────────────────────────────────────
+
+TEST_BUILD := .esphome/host-tests
+
+.PHONY: test-host
+test-host: ## Build and run the pure-C UART framing tests with the host gcc
+	@mkdir -p $(TEST_BUILD)
+	gcc -std=c99 -Wall -Wextra -Werror -Icomponents/nuki_uart_bridge \
+		tests/test_uart_framing.c -o $(TEST_BUILD)/test_uart_framing
+	$(TEST_BUILD)/test_uart_framing
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 

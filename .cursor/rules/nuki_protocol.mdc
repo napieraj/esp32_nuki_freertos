@@ -1,36 +1,48 @@
 ---
-description: Reference for the Nuki Smart Lock Bluetooth API v3.x+, including Gen 5 (Ultra) flows, cryptography, and passive state tracking.
+description: Reference for the Nuki Smart Lock Bluetooth API v2.3.1 (the current version), including 5th-generation (Ultra/Pro/Go) flows, cryptography, and passive state tracking.
 globs: *nuki*.cpp, *nuki*.h, *crypto*.cpp, *ble*.cpp
 ---
 # Nuki BLE API Guidelines
 
-## 1. Protocol Versioning & Service UUIDs
+Source of truth: Nuki Smart Lock BLE API **v2.3.1** (29.05.2026). There is no
+"v3.x" API; v2.3.1 is the latest published version (changelog, spec p.89).
+Page numbers below refer to that PDF. When this file, existing code or memory
+disagrees with the spec, the spec wins. Secondary reference: iranl/NukiBleEsp32.
 
-- **Gen 1-4 (Legacy/Standard):** Keyturner Service `a92ee200-5501-11e4-916c-0800200c9a66`. Pairing is `a92ee100-...`.
-- **Gen 5 Ultra / Firmware 5.x.x+:** Uses the "Ultra" protocol. Service UUID is `a92ee300-...` (and `a92ee400` for pairing).
-- **Ultra Authorization Flow:** Gen 5 pairing bypasses the older Challenge flow. Expect `Authorization Info (0x004C)` and an immediate switch to encrypted communication for `Authorization Data (0x0006)`.
+## 1. Protocol Versioning & Service UUIDs (spec pp.6–8)
 
-## 2. Cryptography (NaCl / libsodium)
+- **Gen 1–4:** Pairing Service `a92ee100-5501-11e4-916c-0800200c9a66`, pairing GDIO `a92ee101-...`.
+- **5th gen (Ultra / Pro / Go):** Pairing Service `a92ee300-...`, pairing GDIO `a92ee301-...` (p.6–7). There is **no** `a92ee400` service.
+- **Keyturner Service (all generations, post-pairing):** `a92ee200-...` with GDIO `a92ee201-...` (unencrypted) and **USDIO `a92ee202-...` for all encrypted traffic** (p.7–8).
+- **Initialization Service** `a92ee000-...` is advertised by a factory-reset lock and has no characteristics (p.6).
+- **Ultra Authorization Flow (p.85–86):** the Ultra flow does **not** bypass the challenge. It is
+  `Request Data(Public Key) → Public Key ↔ → Challenge (0x0004) → Authorization Authenticator (0x0005) → Authorization Info (0x004C) → Authorization Data (0x0006, ENCRYPTED with the derived key, ADATA auth-id 0x7FFFFFFF, payload appId(4) | name(32) | securityPin(uint32)) → Authorization-ID (0x0007, encrypted, authId | uuid)`.
+  Only the second Challenge, the plain Authorization Data and the Authorization-ID Confirmation (0x001E) of the gen 1–4 flow are absent. The 6-digit security PIN must be known **before** pairing an Ultra (p.16, p.19).
 
-- **Algorithms:** Curve25519 (DH), HSalsa20 (KDF), XSalsa20Poly1305 (AEAD).
-- **Integrity:** Always append and verify CRC-CCITT (Polynomial `0x1021`, Initial `0xFFFF`). Nuki multi-byte payloads are strictly **Little-Endian**.
-- **Nonce Management:** 24-byte Nonce. Must STRICTLY increment. **NEVER reuse a nonce with the same secret key.** Persist the nonce counter safely across ESP32 reboots.
+## 2. Cryptography (NaCl / libsodium, spec p.10)
 
-## 3. Data Framing
+- **Algorithms:** Curve25519 (`dh1`), HSalsa20 (`kdf1`: `crypto_core_hsalsa20(k, zeros16, s, "expand 32-byte k")`), XSalsa20-Poly1305 secretbox (`e1`), HMAC-SHA-256 (`h1`, pairing authenticators only — never the KDF).
+- **Integrity:** Always append and verify CRC-CCITT (Polynomial `0x1021`, Initial `0xFFFF`, p.9–10), transmitted little-endian. Nuki multi-byte payloads are strictly **Little-Endian**.
+- **Nonce Management:** 24-byte nonce, random per message. The only protocol requirement is "**NEVER reused with same secret key**" (p.8). A persisted monotonic counter is one valid non-reuse strategy, not something the spec mandates; random 24-byte nonces from a CSPRNG are equally conformant. The reference implementation uses random nonces.
 
-All encrypted BLE writes happen via the General Data Input Output Characteristic.
+## 3. Data Framing (spec pp.8–9)
 
-- **ADATA (Unencrypted Header):** Nonce (24 bytes), Auth ID (4 bytes), Length (2 bytes).
-- **PDATA (Encrypted Payload):** Command ID (2 bytes), Payload Data (N bytes), CRC (2 bytes).
+Encrypted frames travel over **USDIO** (`a92ee202`); pairing frames over the generation-specific pairing GDIO; there is no per-fragment header — indications are raw slices of one frame, reassembled by the ADATA message length (encrypted) or the CRC (plain), see the four raw indications on p.87.
 
-## 4. Key Commands Reference
+- **ADATA (unencrypted header):** Nonce (24 bytes), Auth ID (4 bytes LE), Message length (2 bytes LE) = `16 + |PDATA|`.
+- **PDATA (encrypted):** **Auth ID (4 bytes LE)**, Command ID (2 bytes LE), Payload Data (N bytes), CRC (2 bytes LE). The auth-id is repeated inside the box and must match ADATA (p.9, worked example p.87: PDATA `0200000001000C00418D`).
+- **Plain frames:** Command ID (2), Payload (N), CRC (2).
+
+## 4. Key Commands Reference (spec pp.11–14)
 
 - `0x0001`: Request Data
-- `0x0003`: Public Key / `0x0004`: Challenge / `0x0005`: Authorization Authenticator
-- `0x000C`: Keyturner States (Triggered via Indication on state change. Bit 0 = Critical Battery, Bit 1 = Charging, Bits 2-7 = Battery %).
-- `0x000D`: Lock Action (`1` = Unlock, `2` = Lock, `3` = Unlatch, `4` = Lock 'n' Go).
+- `0x0003`: Public Key / `0x0004`: Challenge / `0x0005`: Authorization Authenticator / `0x0006`: Authorization Data / `0x0007`: Authorization-ID / `0x001E`: Authorization-ID Confirmation / `0x004C`: Authorization Info (Ultra)
+- `0x000C`: Keyturner States (pp.30–33; sent on request and on state change. Battery state byte: Bit 0 = Critical Battery, Bit 1 = Charging, Bits 2–7 = Battery % / 2).
+- `0x000D`: Lock Action (pp.35–36): `action(1) | appId(4) | flags(1) | [nameSuffix(20)] | nK(32)`; `1` = Unlock, `2` = Lock, `3` = Unlatch, `4` = Lock 'n' Go, `5` = Lock 'n' Go with unlatch, `6` = Full lock, `0x81–0x83` = Fob actions. `nK` is the nonce from a preceding `Request Data(Challenge)` on USDIO (p.88).
+- `0x0100`: Simple Lock Action (p.74): `action(1) | [nameSuffix(20)] | nK(32)`, unlock/lock only.
+- `0x000E`: Status (`0x00` COMPLETE, `0x01` ACCEPTED, p.79).
 
 ## 5. Passive State Tracking (Battery Optimization)
 
 - Do NOT actively poll the lock to save Nuki battery.
-- Track the iBeacon RSSI/TX power byte. It rests at `-60 (0xC4)` and flips to `-59 (0xC5)` on a state change. Trigger a connection only when `0xC5` is detected to fetch `0x000C`.
+- Track the iBeacon RSSI/TX power byte. It rests at `-60 (0xC4)` and flips to `-59 (0xC5)` on a state change. Trigger a connection only when `0xC5` is detected to fetch `0x000C`. (Observed behaviour, not in the spec.)

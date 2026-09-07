@@ -1,5 +1,8 @@
+import logging
+
 import esphome.codegen as cg
 import esphome.config_validation as cv
+import esphome.final_validate as fv
 from esphome.components import lock
 from esphome.components.esp32 import (
     add_idf_component,
@@ -7,9 +10,7 @@ from esphome.components.esp32 import (
     include_builtin_idf_component,
 )
 from esphome.const import CONF_PIN
-import esphome.final_validate as fv
 from esphome.core import CORE
-import logging
 
 LOGGER = logging.getLogger(__name__)
 
